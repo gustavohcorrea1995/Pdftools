@@ -319,27 +319,20 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
 
           if(!text) return;
 
-          const xPt = parseFloat(w[1]);
-          const yPt = parseFloat(w[2]);
-          const xMaxPt = parseFloat(w[3]);
-          const yMaxPt = parseFloat(w[4]);
-          const PT_TO_PX = 120 / 72;
+          const x = parseFloat(w[1]);
+          const y = parseFloat(w[2]);
+          const xMax = parseFloat(w[3]);
+          const yMax = parseFloat(w[4]);
 
           textBoxes.push({
             id: `p${pageIndex + 1}-w${wordIndex + 1}`,
             page: pageIndex + 1,
-            // Display coordinates (120 DPI PNG).
-            x: xPt * PT_TO_PX,
-            y: yPt * PT_TO_PX,
-            width: Math.max(1, (xMaxPt - xPt) * PT_TO_PX),
-            height: Math.max(1, (yMaxPt - yPt) * PT_TO_PX),
-            // Original PDF coordinates (points), used for real redaction.
-            pdfX: xPt,
-            pdfY: yPt,
-            pdfWidth: Math.max(1, xMaxPt - xPt),
-            pdfHeight: Math.max(1, yMaxPt - yPt),
+            x,
+            y,
+            width: Math.max(1, xMax - x),
+            height: Math.max(1, yMax - y),
             text,
-            fontSize: Math.max(6, yMaxPt - yPt)
+            fontSize: Math.max(6, yMax - y)
           });
         });
       });
@@ -393,138 +386,137 @@ app.get('/api/preview/:id/:page', (req, res) => {
 
 app.use('/uploads', express.static(UP));
 
-// ---------- EDIT: add text / image overlay ----------
-app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
+// ---------- EDITOR VISUAL: redação real + edição + pré-visualização ----------
+async function loadMuPDF(){
+  const mod = await import('mupdf');
+  return mod.default || mod;
+}
+
+function normalizeRect(a){
+  const x = Math.max(0, Number(a.x) || 0);
+  const y = Math.max(0, Number(a.y) || 0);
+  const width = Math.max(1, Number(a.width) || 1);
+  const height = Math.max(1, Number(a.height) || 1);
+  return [x, y, x + width, y + height];
+}
+
+async function applyRedactionsToPdf(inputBytes, operations){
+  const mupdf = await loadMuPDF();
+  const doc = mupdf.Document.openDocument(inputBytes, 'application/pdf');
+
   try {
-    const { fileId, annotations } = req.body;
+    const byPage = new Map();
+    for(const op of (operations || [])){
+      if(op.type !== 'redact' && op.type !== 'replace') continue;
+      const pageNum = Number(op.page);
+      if(!Number.isInteger(pageNum) || pageNum < 1 || pageNum > doc.countPages()) continue;
+      if(!byPage.has(pageNum)) byPage.set(pageNum, []);
+      byPage.get(pageNum).push(op);
+    }
+
+    for(const [pageNum, ops] of byPage){
+      const page = doc.loadPage(pageNum - 1);
+      try{
+        for(const op of ops){
+          const redact = page.createAnnotation('Redact');
+          redact.setRect(normalizeRect(op));
+          redact.update();
+        }
+        // Sem caixa preta: remove o conteúdo atingido sem desenhar uma tarja.
+        page.applyRedactions(false);
+      } finally {
+        page.destroy();
+      }
+    }
+
+    return Buffer.from(doc.saveToBuffer('').asUint8Array());
+  } finally {
+    doc.destroy();
+  }
+}
+
+async function renderPdfPage(pdfBytes, pageNumber){
+  const id = uuid();
+  const pdfPath = path.join(TMP, id + '.pdf');
+  const prefix = path.join(TMP, id + '-page');
+  fs.writeFileSync(pdfPath, pdfBytes);
+  try{
+    await run('pdftoppm', ['-f', String(pageNumber), '-singlefile', '-png', '-r', '120', pdfPath, prefix]);
+    const pngPath = prefix + '.png';
+    const data = await fs.promises.readFile(pngPath);
+    return data;
+  } finally {
+    cleanup(pdfPath, prefix + '.png');
+  }
+}
+
+// Pré-visualiza as alterações já aplicadas no PDF real antes de salvar.
+app.post('/api/edit/preview', async (req, res) => {
+  try{
+    const { fileId, operations, page } = req.body;
     const filePath = path.join(UP, fileId);
+    if(!fs.existsSync(filePath)) return res.status(400).json({error:'Arquivo não encontrado. Reenvie o PDF.'});
 
-    if(!fs.existsSync(filePath)){
-      return res.status(400).json({
-        error: 'Arquivo não encontrado. Reenvie o PDF.'
-      });
-    }
+    const original = fs.readFileSync(filePath);
+    const redacted = await applyRedactionsToPdf(original, JSON.parse(operations || '[]'));
+    const png = await renderPdfPage(redacted, Number(page) || 1);
+    res.set({'Content-Type':'image/png','Cache-Control':'no-store'});
+    res.end(png);
+  }catch(e){
+    console.error('Falha na pré-visualização:', e);
+    res.status(500).json({error:e.message});
+  }
+});
 
-    const anns = JSON.parse(annotations || '[]');
-    const originalBytes = fs.readFileSync(filePath);
+// Salva as alterações no PDF. A exclusão usa REDACT e remove o conteúdo de verdade.
+app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
+  try{
+    const { fileId, operations } = req.body;
+    const filePath = path.join(UP, fileId);
+    if(!fs.existsSync(filePath)) return res.status(400).json({error:'Arquivo não encontrado. Reenvie o PDF.'});
 
-    // MuPDF é usado somente para REDAÇÃO real. Diferente de um retângulo
-    // branco, applyRedactions() remove o conteúdo que está na área.
-    let mupdf;
-    try {
-      mupdf = await import('mupdf');
-    } catch (err) {
-      throw new Error(
-        'O módulo de redação PDF (mupdf) não está instalado. Adicione "mupdf": "1.28.0" ao package.json e faça um novo deploy.'
-      );
-    }
+    const ops = JSON.parse(operations || '[]');
+    const original = fs.readFileSync(filePath);
 
-    const redactionDoc = mupdf.Document.openDocument(
-      originalBytes,
-      'application/pdf'
-    );
-    const redactionPdf = redactionDoc.asPDF();
+    // Primeiro remove permanentemente o conteúdo selecionado.
+    let editedBytes = await applyRedactionsToPdf(original, ops);
 
-    const pagesWithRedactions = new Set();
-
-    for(const a of anns){
-      if(!a.id || !a.id.startsWith('p')) continue;
-
-      const pageIndex = Number(a.page) - 1;
-      if(!Number.isInteger(pageIndex) || pageIndex < 0) continue;
-
-      const x = Number(a.x);
-      const yTop = Number(a.y);
-      const width = Number(a.width);
-      const height = Number(a.height);
-
-      if(!Number.isFinite(x) || !Number.isFinite(yTop) ||
-         !Number.isFinite(width) || !Number.isFinite(height) ||
-         width <= 0 || height <= 0) continue;
-
-      const page = redactionPdf.loadPage(pageIndex);
-      const pageHeight = page.getBounds()[3] - page.getBounds()[1];
-
-      // pdftotext usa origem no topo; MuPDF/PDF usa origem embaixo.
-      const y1 = pageHeight - yTop - height;
-      const y2 = pageHeight - yTop;
-
-      const redact = page.createAnnotation('Redact');
-      redact.setRect([x, y1, x + width, y2]);
-      redact.update();
-
-      pagesWithRedactions.add(pageIndex);
-      page.destroy();
-    }
-
-    // Aplicação permanente: o texto original deixa de existir na região.
-    for(const pageIndex of pagesWithRedactions){
-      const page = redactionPdf.loadPage(pageIndex);
-      page.applyRedactions();
-      page.destroy();
-    }
-
-    const redactedBytes = Buffer.from(
-      redactionPdf.saveToBuffer('garbage').asUint8Array()
-    );
-
-    redactionDoc.destroy();
-
-    // Depois da redação, usamos pdf-lib apenas para desenhar texto novo
-    // e/ou imagens. O texto antigo já foi removido antes desta etapa.
-    const doc = await PDFDocument.load(redactedBytes, {
-      ignoreEncryption: true
-    });
-
+    // Depois mantém o suporte a inserir/substituir texto e imagem.
+    const doc = await PDFDocument.load(editedBytes, {ignoreEncryption:true});
     const font = await doc.embedFont(StandardFonts.Helvetica);
 
-    for(const a of anns){
+    for(const a of ops){
       const page = doc.getPage(Number(a.page) - 1);
       if(!page) continue;
+      const {height} = page.getSize();
 
-      const { height } = page.getSize();
-
-      // Edição de texto: a área já foi redigida acima. Agora só adiciona
-      // o novo texto se o usuário não tiver escolhido Excluir.
-      if(a.id && a.id.startsWith('p') && a.text !== undefined){
-        if(!a.deleted && String(a.text).trim().length){
-          const x = Number(a.x) || 0;
-          const y = Number(a.y) || 0;
-          const fontSize = Number(a.fontSize) || 10;
-
-          page.drawText(String(a.text), {
-            x,
-            y: height - y - fontSize,
-            size: fontSize,
-            font,
-            color: rgb(0.1, 0.1, 0.1)
-          });
-        }
-        continue;
-      }
-
-      // Texto novo, que não é edição de um texto existente.
-      if(a.type === 'text'){
-        page.drawText(a.text || '', {
-          x: Number(a.x) || 0,
-          y: height - (Number(a.y) || 0),
-          size: Number(a.size) || 16,
-          font,
-          color: rgb(...(a.color || [0, 0, 0]))
+      if(a.type === 'replace'){
+        const x = Number(a.x) || 0;
+        const y = Number(a.y) || 0;
+        const size = Number(a.fontSize) || Math.max(7, Number(a.height) || 12);
+        page.drawText(String(a.text || ''), {
+          x, y: height - y - size, size, font,
+          color: rgb(0.1,0.1,0.1)
         });
         continue;
       }
 
-      // Imagem/carimbo.
+      if(a.type === 'text'){
+        const x = Number(a.x) || 0;
+        const y = Number(a.y) || 0;
+        page.drawText(String(a.text || ''), {
+          x, y: height - y, size: Number(a.size) || 16, font,
+          color: rgb(...(a.color || [0,0,0]))
+        });
+      }
+
       if(a.type === 'image' && req.file){
         const imgBytes = fs.readFileSync(req.file.path);
         const img = req.file.mimetype.includes('png')
           ? await doc.embedPng(imgBytes)
           : await doc.embedJpg(imgBytes);
-
         const width = Number(a.width) || 150;
         const imgHeight = (width / img.width) * img.height;
-
         page.drawImage(img, {
           x: Number(a.x) || 0,
           y: height - (Number(a.y) || 0) - imgHeight,
@@ -534,19 +526,15 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
       }
     }
 
-    const outBytes = await doc.save();
+    editedBytes = await doc.save();
     const outPath = path.join(TMP, uuid() + '.pdf');
-    fs.writeFileSync(outPath, outBytes);
+    fs.writeFileSync(outPath, editedBytes);
 
-    sendFileAndCleanup(
-      res,
-      outPath,
-      'editado.pdf',
-      req.file ? [req.file.path] : []
-    );
-  } catch(e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    sendFileAndCleanup(res, outPath, 'editado.pdf', req.file ? [req.file.path] : []);
+  }catch(e){
+    console.error('Falha ao editar PDF:', e);
+    if(req.file) cleanup(req.file.path);
+    if(!res.headersSent) res.status(500).json({error:e.message});
   }
 });
 
