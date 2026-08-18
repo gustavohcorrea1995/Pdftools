@@ -319,20 +319,30 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
 
           if(!text) return;
 
-          const x = parseFloat(w[1]);
-          const y = parseFloat(w[2]);
-          const xMax = parseFloat(w[3]);
-          const yMax = parseFloat(w[4]);
+          const PT_TO_PX = 120 / 72;
+
+          const xPt = parseFloat(w[1]);
+          const yPt = parseFloat(w[2]);
+          const xMaxPt = parseFloat(w[3]);
+          const yMaxPt = parseFloat(w[4]);
+
+          // pdftotext usa pontos; a página é renderizada pelo pdftoppm
+          // a 120 DPI. Convertendo aqui, a caixa fica sobre o texto
+          // real da imagem, sem precisar "caçar" a informação.
+          const x = xPt * PT_TO_PX;
+          const y = yPt * PT_TO_PX;
+          const width = Math.max(1, (xMaxPt - xPt) * PT_TO_PX);
+          const height = Math.max(1, (yMaxPt - yPt) * PT_TO_PX);
 
           textBoxes.push({
             id: `p${pageIndex + 1}-w${wordIndex + 1}`,
             page: pageIndex + 1,
             x,
             y,
-            width: Math.max(1, xMax - x),
-            height: Math.max(1, yMax - y),
+            width,
+            height,
             text,
-            fontSize: Math.max(6, yMax - y)
+            fontSize: Math.max(6, yMaxPt - yPt)
           });
         });
       });
@@ -427,24 +437,29 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
         const textHeight = Number(a.height) || 12;
         const fontSize = Number(a.fontSize) || Math.max(7, textHeight);
 
-        // Cobre o texto antigo com branco.
+        // Cobre o texto antigo. Quando "deleted" for true, não desenha
+        // nada por cima: o texto fica efetivamente removido visualmente.
+        const paddingX = 2;
+        const paddingY = 2;
+
         page.drawRectangle({
-          x: Math.max(0, x - 1),
-          y: height - y - textHeight - 1,
-          width: width + 2,
-          height: textHeight + 2,
+          x: Math.max(0, x - paddingX),
+          y: Math.max(0, height - y - textHeight - paddingY),
+          width: width + paddingX * 2,
+          height: textHeight + paddingY * 2,
           color: rgb(1, 1, 1),
           borderWidth: 0
         });
 
-        // Desenha o texto novo no mesmo lugar.
-        page.drawText(String(a.text || ''), {
-          x,
-          y: height - y - fontSize,
-          size: fontSize,
-          font,
-          color: rgb(0.1, 0.1, 0.1)
-        });
+        if(!a.deleted && String(a.text || '').length){
+          page.drawText(String(a.text), {
+            x,
+            y: height - y - fontSize,
+            size: fontSize,
+            font,
+            color: rgb(0.1, 0.1, 0.1)
+          });
+        }
 
         continue;
       }
