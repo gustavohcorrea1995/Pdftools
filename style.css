@@ -1,0 +1,163 @@
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap');
+
+:root{
+  --ink:#12181f;
+  --ink-2:#1c2530;
+  --paper:#f6f2e8;
+  --paper-dim:#e9e2d0;
+  --stamp:#c1442d;
+  --stamp-dark:#9c3220;
+  --mustard:#d7a93a;
+  --line:#3a4552;
+  --text-dim:#a9b3bf;
+  --radius:10px;
+}
+
+*{box-sizing:border-box;}
+html,body{margin:0;padding:0;}
+body{
+  background:var(--ink);
+  color:var(--paper);
+  font-family:'IBM Plex Sans',sans-serif;
+  min-height:100vh;
+}
+h1,h2,h3{font-family:'Fraunces',serif;font-weight:600;letter-spacing:-0.01em;margin:0;}
+a{color:inherit;}
+
+.topbar{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:22px 40px;border-bottom:1px solid var(--line);
+}
+.brand{font-family:'Fraunces',serif;font-size:20px;letter-spacing:-0.02em;}
+.brand strong{color:var(--stamp);}
+
+main{max-width:1080px;margin:0 auto;padding:0 40px 100px;}
+
+.hero{padding-top:64px;text-align:left;}
+.hero h1{font-size:clamp(32px,5vw,52px);line-height:1.05;max-width:720px;}
+.hero p{color:var(--text-dim);font-size:18px;margin:16px 0 44px;max-width:520px;}
+
+.tool-grid{
+  display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+  gap:14px;
+}
+.tool-card{
+  background:var(--ink-2);
+  border:1px solid var(--line);
+  border-radius:var(--radius);
+  padding:22px;
+  cursor:pointer;
+  text-align:left;
+  transition:transform .15s ease, border-color .15s ease, background .15s ease;
+  position:relative;
+  overflow:hidden;
+}
+.tool-card:hover{
+  transform:translateY(-3px);
+  border-color:var(--stamp);
+  background:#212b38;
+}
+.tool-card .icon{
+  font-size:26px;display:inline-block;margin-bottom:14px;
+  width:44px;height:44px;line-height:44px;text-align:center;
+  border-radius:50%;background:var(--paper);color:var(--ink);
+}
+.tool-card h3{font-size:17px;margin-bottom:6px;color:var(--paper);}
+.tool-card p{font-size:13.5px;color:var(--text-dim);margin:0;line-height:1.4;}
+.tool-card .stamp-mark{
+  position:absolute;top:14px;right:16px;
+  font-family:'IBM Plex Mono',monospace;font-size:10px;letter-spacing:.08em;
+  color:var(--mustard);text-transform:uppercase;border:1px solid var(--mustard);
+  border-radius:4px;padding:2px 6px;opacity:.85;transform:rotate(4deg);
+}
+
+.workspace{padding-top:40px;}
+.workspace.hidden, .hero.hidden{display:none;}
+.back-btn{
+  background:none;border:none;color:var(--text-dim);font-size:14px;
+  cursor:pointer;margin-bottom:18px;padding:0;font-family:'IBM Plex Sans',sans-serif;
+}
+.back-btn:hover{color:var(--paper);}
+#toolTitle{font-size:28px;margin-bottom:24px;}
+
+.dropzone{
+  border:2px dashed var(--line);
+  border-radius:var(--radius);
+  padding:48px 24px;
+  text-align:center;
+  cursor:pointer;
+  transition:border-color .15s ease, background .15s ease;
+  background:var(--ink-2);
+}
+.dropzone.drag{border-color:var(--stamp);background:#212b38;}
+.dropzone p{color:var(--text-dim);margin:6px 0 0;font-size:14px;}
+.dropzone .dz-title{font-size:16px;color:var(--paper);}
+
+.file-list{margin-top:18px;display:flex;flex-direction:column;gap:8px;}
+.file-row{
+  display:flex;align-items:center;justify-content:space-between;
+  background:var(--ink-2);border:1px solid var(--line);border-radius:8px;
+  padding:10px 14px;font-size:14px;
+}
+.file-row .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%;}
+.file-row button{background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:16px;}
+.file-row button:hover{color:var(--stamp);}
+
+.field{margin-top:18px;}
+.field label{display:block;font-size:13px;color:var(--text-dim);margin-bottom:6px;}
+.field input[type=text], .field select{
+  width:100%;background:var(--ink-2);border:1px solid var(--line);color:var(--paper);
+  padding:10px 12px;border-radius:8px;font-family:'IBM Plex Sans',sans-serif;font-size:14px;
+}
+.field-row{display:flex;gap:14px;flex-wrap:wrap;}
+.field-row .field{flex:1;min-width:160px;}
+
+.btn{
+  margin-top:26px;
+  background:var(--stamp);color:#fff;border:none;
+  padding:13px 26px;border-radius:8px;font-size:15px;font-weight:600;
+  cursor:pointer;transition:background .15s ease;
+  font-family:'IBM Plex Sans',sans-serif;
+}
+.btn:hover{background:var(--stamp-dark);}
+.btn:disabled{opacity:.5;cursor:not-allowed;}
+.btn.secondary{background:transparent;border:1px solid var(--line);color:var(--paper);}
+.btn.secondary:hover{border-color:var(--paper);background:none;}
+
+.pages-grid{display:flex;flex-wrap:wrap;gap:14px;margin-top:20px;}
+.page-thumb{
+  width:120px;background:var(--ink-2);border:1px solid var(--line);border-radius:8px;
+  padding:8px;text-align:center;position:relative;cursor:grab;
+}
+.page-thumb.marked{opacity:.35;border-color:var(--stamp);}
+.page-thumb img{width:100%;border-radius:4px;display:block;transition:transform .15s ease;}
+.page-thumb .pnum{font-size:11px;color:var(--text-dim);margin-top:6px;font-family:'IBM Plex Mono',monospace;}
+.page-thumb .actions{display:flex;justify-content:center;gap:6px;margin-top:6px;}
+.page-thumb .actions button{
+  background:var(--ink);border:1px solid var(--line);color:var(--paper);
+  border-radius:4px;font-size:11px;padding:3px 6px;cursor:pointer;
+}
+.page-thumb .actions button:hover{border-color:var(--stamp);}
+
+#toast{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);
+  background:var(--paper);color:var(--ink);padding:12px 20px;border-radius:8px;
+  font-size:14px;opacity:0;pointer-events:none;transition:all .25s ease;
+  box-shadow:0 8px 24px rgba(0,0,0,.4);
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0);}
+#toast.error{background:var(--stamp);color:#fff;}
+
+.spinner{
+  width:16px;height:16px;border:2px solid rgba(255,255,255,.4);
+  border-top-color:#fff;border-radius:50%;
+  display:inline-block;vertical-align:middle;margin-right:8px;
+  animation:spin .7s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.hint{font-size:13px;color:var(--text-dim);margin-top:10px;line-height:1.5;}
+
+@media (max-width:640px){
+  .topbar,main{padding-left:20px;padding-right:20px;}
+}

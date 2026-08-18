@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDFTools — Junte, edite e converta seus arquivos</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">📄 <span>PDF<strong>Tools</strong></span></div>
+  <nav id="nav"></nav>
+</header>
+
+<main>
+  <section class="hero" id="hero">
+    <h1>Tudo para seus PDFs, em um só lugar</h1>
+    <p>Junte, divida, comprima, converta e edite arquivos — direto no navegador.</p>
+    <div class="tool-grid" id="toolGrid"></div>
+  </section>
+
+  <section class="workspace hidden" id="workspace">
+    <button class="back-btn" id="backBtn">← Voltar</button>
+    <h2 id="toolTitle"></h2>
+    <div id="toolBody"></div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
