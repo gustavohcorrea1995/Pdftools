@@ -259,72 +259,249 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
   const inputPath = req.file.path;
   const id = uuid();
   const workDir = path.join(UP, 'thumbs_' + id);
-  fs.mkdirSync(workDir);
+  fs.mkdirSync(workDir, { recursive: true });
+
   try {
     const bytes = fs.readFileSync(inputPath);
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const pageCount = src.getPageCount();
-    // resolução mais alta que antes (era 60) para permitir clicar com precisão no editor visual
-    await run('pdftoppm', ['-png', '-r', '120', inputPath, path.join(workDir, 'p')]);
-    const files = fs.readdirSync(workDir).sort();
+
+    // Renderiza cada página para o editor visual.
+    await run('pdftoppm', [
+      '-png',
+      '-r', '120',
+      inputPath,
+      path.join(workDir, 'p')
+    ]);
+
+    const files = fs.readdirSync(workDir)
+      .filter(f => f.toLowerCase().endsWith('.png'))
+      .sort();
+
     const finalName = id + '.pdf';
     fs.copyFileSync(inputPath, path.join(UP, finalName));
-    // tamanho real de cada página, em pontos (necessário para converter clique-na-imagem -> coordenada do PDF)
+
     const pageSizes = src.getPages().map(p => {
       const { width, height } = p.getSize();
       return { width, height };
     });
+
+    // Extrai as caixas de texto existentes.
+    let textBoxes = [];
+
+    try {
+      const bboxPath = path.join(workDir, 'bbox.html');
+
+      await run('pdftotext', [
+        '-bbox',
+        '-enc', 'UTF-8',
+        inputPath,
+        bboxPath
+      ]);
+
+      const html = fs.readFileSync(bboxPath, 'utf8');
+
+      const pages = [
+        ...html.matchAll(/<page[^>]*>([\s\S]*?)<\/page>/gi)
+      ];
+
+      pages.forEach((pageMatch, pageIndex) => {
+        const words = [
+          ...pageMatch[1].matchAll(
+            /<word[^>]*xMin="([0-9.]+)"[^>]*yMin="([0-9.]+)"[^>]*xMax="([0-9.]+)"[^>]*yMax="([0-9.]+)"[^>]*>([\s\S]*?)<\/word>/gi
+          )
+        ];
+
+        words.forEach((w, wordIndex) => {
+          const text = w[5]
+            .replace(/<[^>]+>/g, '')
+            .trim();
+
+          if(!text) return;
+
+          const x = parseFloat(w[1]);
+          const y = parseFloat(w[2]);
+          const xMax = parseFloat(w[3]);
+          const yMax = parseFloat(w[4]);
+
+          textBoxes.push({
+            id: `p${pageIndex + 1}-w${wordIndex + 1}`,
+            page: pageIndex + 1,
+            x,
+            y,
+            width: Math.max(1, xMax - x),
+            height: Math.max(1, yMax - y),
+            text,
+            fontSize: Math.max(6, yMax - y)
+          });
+        });
+      });
+    } catch(err) {
+      console.log('PDF sem camada de texto ou falha no OCR:', err.message);
+    }
+
     res.json({
       fileId: finalName,
       pageCount,
       pageSizes,
-      thumbnails: files.map((f, i) => `/uploads/thumbs_${id}/${f}`)
+      thumbnails: files.map((f, index) =>
+        `/api/preview/${finalName}/${index + 1}`
+      ),
+      textBoxes
     });
-  } catch (e) {
+
+  } catch(e) {
     res.status(500).json({ error: e.message });
   } finally {
     cleanup(inputPath);
   }
 });
+
+
+// ---------- PREVIEW: entrega as páginas renderizadas do editor ----------
+app.get('/api/preview/:id/:page', (req, res) => {
+  try {
+    const id = req.params.id.replace(/\.pdf$/i, '');
+    const page = Number(req.params.page);
+
+    if(!Number.isInteger(page) || page < 1){
+      return res.status(400).send('Página inválida.');
+    }
+
+    const filePath = path.join(
+      UP,
+      'thumbs_' + id,
+      `p-${page}.png`
+    );
+
+    if(!fs.existsSync(filePath)){
+      return res.status(404).send('Página do PDF não encontrada.');
+    }
+
+    res.type('png').sendFile(path.resolve(filePath));
+  } catch(e) {
+    res.status(500).send(e.message);
+  }
+});
+
 app.use('/uploads', express.static(UP));
 
 // ---------- EDIT: add text / image overlay ----------
 app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
-  // body: fileId (from /api/inspect), annotations = JSON array
-  // annotation: { page, type:'text'|'image', x, y, size, text, color, width }
   try {
     const { fileId, annotations } = req.body;
-    const filePath = path.join(UP, fileId);
-    if (!fs.existsSync(filePath)) return res.status(400).json({ error: 'Arquivo não encontrado. Reenvie o PDF.' });
-    const bytes = fs.readFileSync(filePath);
-    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
-    const font = await doc.embedFont(StandardFonts.Helvetica);
-    const anns = JSON.parse(annotations || '[]');
 
-    for (const a of anns) {
+    const filePath = path.join(UP, fileId);
+
+    if(!fs.existsSync(filePath)){
+      return res.status(400).json({
+        error: 'Arquivo não encontrado. Reenvie o PDF.'
+      });
+    }
+
+    const bytes = fs.readFileSync(filePath);
+
+    const doc = await PDFDocument.load(bytes, {
+      ignoreEncryption: true
+    });
+
+    const font = await doc.embedFont(
+      StandardFonts.Helvetica
+    );
+
+    const anns = JSON.parse(
+      annotations || '[]'
+    );
+
+    for(const a of anns){
       const page = doc.getPage(a.page - 1);
+      if(!page) continue;
+
       const { height } = page.getSize();
-      if (a.type === 'text') {
+
+      // Edita um texto existente encontrado pelo pdftotext.
+      if(a.id && a.id.startsWith('p') && a.text !== undefined){
+        const x = Number(a.x) || 0;
+        const y = Number(a.y) || 0;
+        const width = Number(a.width) || 20;
+        const textHeight = Number(a.height) || 12;
+        const fontSize = Number(a.fontSize) || Math.max(7, textHeight);
+
+        // Cobre o texto antigo com branco.
+        page.drawRectangle({
+          x: Math.max(0, x - 1),
+          y: height - y - textHeight - 1,
+          width: width + 2,
+          height: textHeight + 2,
+          color: rgb(1, 1, 1),
+          borderWidth: 0
+        });
+
+        // Desenha o texto novo no mesmo lugar.
+        page.drawText(String(a.text || ''), {
+          x,
+          y: height - y - fontSize,
+          size: fontSize,
+          font,
+          color: rgb(0.1, 0.1, 0.1)
+        });
+
+        continue;
+      }
+
+      // Mantém suporte para adicionar texto novo.
+      if(a.type === 'text'){
         page.drawText(a.text || '', {
-          x: a.x, y: height - a.y, size: a.size || 16, font,
+          x: Number(a.x) || 0,
+          y: height - (Number(a.y) || 0),
+          size: Number(a.size) || 16,
+          font,
           color: rgb(...(a.color || [0, 0, 0]))
         });
-      } else if (a.type === 'image' && req.file) {
+
+        continue;
+      }
+
+      // Mantém suporte para adicionar imagem/carimbo.
+      if(a.type === 'image' && req.file){
         const imgBytes = fs.readFileSync(req.file.path);
+
         const img = req.file.mimetype.includes('png')
           ? await doc.embedPng(imgBytes)
           : await doc.embedJpg(imgBytes);
-        const w = a.width || img.width;
-        const h = (w / img.width) * img.height;
-        page.drawImage(img, { x: a.x, y: height - a.y - h, width: w, height: h });
+
+        const width = Number(a.width) || 150;
+        const imgHeight = (width / img.width) * img.height;
+
+        page.drawImage(img, {
+          x: Number(a.x) || 0,
+          y: height - (Number(a.y) || 0) - imgHeight,
+          width,
+          height: imgHeight
+        });
       }
     }
+
     const outBytes = await doc.save();
-    const outPath = path.join(TMP, uuid() + '.pdf');
+
+    const outPath = path.join(
+      TMP,
+      uuid() + '.pdf'
+    );
+
     fs.writeFileSync(outPath, outBytes);
-    sendFileAndCleanup(res, outPath, 'editado.pdf', req.file ? [req.file.path] : []);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+
+    sendFileAndCleanup(
+      res,
+      outPath,
+      'editado.pdf',
+      req.file ? [req.file.path] : []
+    );
+
+  } catch(e) {
+    res.status(500).json({
+      error: e.message
+    });
   }
 });
 
