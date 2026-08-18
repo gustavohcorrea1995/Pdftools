@@ -245,13 +245,20 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
     const bytes = fs.readFileSync(inputPath);
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const pageCount = src.getPageCount();
-    await run('pdftoppm', ['-png', '-r', '60', inputPath, path.join(workDir, 'p')]);
+    // resolução mais alta que antes (era 60) para permitir clicar com precisão no editor visual
+    await run('pdftoppm', ['-png', '-r', '120', inputPath, path.join(workDir, 'p')]);
     const files = fs.readdirSync(workDir).sort();
     const finalName = id + '.pdf';
     fs.copyFileSync(inputPath, path.join(UP, finalName));
+    // tamanho real de cada página, em pontos (necessário para converter clique-na-imagem -> coordenada do PDF)
+    const pageSizes = src.getPages().map(p => {
+      const { width, height } = p.getSize();
+      return { width, height };
+    });
     res.json({
       fileId: finalName,
       pageCount,
+      pageSizes,
       thumbnails: files.map((f, i) => `/uploads/thumbs_${id}/${f}`)
     });
   } catch (e) {
