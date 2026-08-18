@@ -377,13 +377,49 @@ RENDERERS['edit'] = (root)=>{
   };
 };
 
-// ---------- Adicionar texto/imagem ----------
+// ---------- Adicionar texto/imagem (editor visual: clique na página para posicionar) ----------
 RENDERERS['annotate'] = (root)=>{
   const dz = makeDropzone(root, { accept:'.pdf', multiple:false, label:'Arraste um PDF' });
-  let fileId = null, pageCount = 0;
+  let fileId = null, pageCount = 0, pageSizes = [], thumbs = [], currentPage = 1;
+  let markerPt = null; // {x, y} em pontos do PDF, origem no topo-esquerdo
+
   const info = document.createElement('p');
   info.className = 'hint';
   root.appendChild(info);
+
+  const pageNav = document.createElement('div');
+  pageNav.className = 'field-row hidden';
+  pageNav.innerHTML = `
+    <button type="button" id="prevPage" class="btn-ghost">← Página anterior</button>
+    <span id="pageIndicator" style="align-self:center;"></span>
+    <button type="button" id="nextPage" class="btn-ghost">Próxima página →</button>`;
+  root.appendChild(pageNav);
+
+  const previewWrap = document.createElement('div');
+  previewWrap.className = 'annotate-preview hidden';
+  previewWrap.style.cssText = 'position:relative;display:inline-block;max-width:100%;border:1px solid var(--line,#3a4552);cursor:crosshair;';
+  root.appendChild(previewWrap);
+
+  const previewImg = document.createElement('img');
+  previewImg.style.cssText = 'display:block;max-width:100%;height:auto;user-select:none;';
+  previewWrap.appendChild(previewImg);
+
+  const marker = document.createElement('div');
+  marker.style.cssText = 'position:absolute;width:14px;height:14px;border-radius:50%;background:var(--stamp,#c1442d);border:2px solid #fff;transform:translate(-50%,-50%);display:none;pointer-events:none;box-shadow:0 0 0 2px rgba(0,0,0,.3);';
+  previewWrap.appendChild(marker);
+
+  const clickHint = document.createElement('p');
+  clickHint.className = 'hint hidden';
+  clickHint.textContent = 'Clique no ponto da página onde o texto/imagem deve aparecer.';
+  root.appendChild(clickHint);
+
+  function renderPage(){
+    previewImg.src = thumbs[currentPage - 1];
+    document.getElementById('pageIndicator').textContent = `Página ${currentPage} de ${pageCount}`;
+    document.getElementById('page').value = currentPage;
+    marker.style.display = 'none';
+    markerPt = null;
+  }
 
   dz.onchange = async (files)=>{
     if(files.length !== 1) return;
@@ -394,16 +430,39 @@ RENDERERS['annotate'] = (root)=>{
       const res = await postForm('/api/inspect', fd);
       const data = await res.json();
       fileId = data.fileId; pageCount = data.pageCount;
-      info.textContent = `PDF carregado (${pageCount} página(s)). Preencha os dados abaixo — as coordenadas (0,0) ficam no canto superior esquerdo da página, em pontos.`;
+      pageSizes = data.pageSizes; thumbs = data.thumbnails;
+      currentPage = 1;
+      info.textContent = `PDF carregado (${pageCount} página(s)). Clique na página abaixo para escolher onde o conteúdo vai aparecer.`;
+      pageNav.classList.toggle('hidden', pageCount <= 1);
+      previewWrap.classList.remove('hidden');
+      clickHint.classList.remove('hidden');
+      renderPage();
     }catch(e){ toast(e.message, true); info.textContent=''; }
   };
+
+  previewWrap.addEventListener('click', (e)=>{
+    if(!thumbs.length) return;
+    const rect = previewImg.getBoundingClientRect();
+    const clickX = e.clientX - rect.left;
+    const clickY = e.clientY - rect.top;
+    const size = pageSizes[currentPage - 1];
+    // converte pixel clicado na imagem exibida -> ponto real do PDF (mesma escala, proporcional)
+    const ptX = (clickX / rect.width) * size.width;
+    const ptY = (clickY / rect.height) * size.height;
+    markerPt = { x: ptX, y: ptY };
+    marker.style.left = clickX + 'px';
+    marker.style.top = clickY + 'px';
+    marker.style.display = 'block';
+    document.getElementById('x').value = Math.round(ptX);
+    document.getElementById('y').value = Math.round(ptY);
+  });
 
   const row1 = document.createElement('div');
   row1.className = 'field-row';
   row1.innerHTML = `
-    <div class="field"><label>Página</label><input type="text" id="page" placeholder="1"></div>
-    <div class="field"><label>X (pontos)</label><input type="text" id="x" placeholder="50"></div>
-    <div class="field"><label>Y (pontos, a partir do topo)</label><input type="text" id="y" placeholder="50"></div>`;
+    <div class="field"><label>Página</label><input type="text" id="page" value="1" readonly></div>
+    <div class="field"><label>X (pontos)</label><input type="text" id="x" placeholder="clique na página"></div>
+    <div class="field"><label>Y (pontos, a partir do topo)</label><input type="text" id="y" placeholder="clique na página"></div>`;
   root.appendChild(row1);
 
   const row2 = document.createElement('div');
@@ -425,18 +484,23 @@ RENDERERS['annotate'] = (root)=>{
   imgField.appendChild(imgInput);
   root.appendChild(imgField);
 
+  document.getElementById('prevPage').onclick = ()=>{ if(currentPage>1){ currentPage--; renderPage(); } };
+  document.getElementById('nextPage').onclick = ()=>{ if(currentPage<pageCount){ currentPage++; renderPage(); } };
+
   const btn = makeButton(root, 'Inserir e baixar PDF');
   btn.dataset.label = btn.textContent;
   btn.onclick = async ()=>{
     if(!fileId) return toast('Envie um PDF primeiro.', true);
-    const page = parseInt(document.getElementById('page').value || '1', 10);
-    const x = parseFloat(document.getElementById('x').value || '50');
-    const y = parseFloat(document.getElementById('y').value || '50');
+    if(!markerPt) return toast('Clique na página para escolher onde o conteúdo vai aparecer.', true);
+    const page = currentPage;
+    const x = markerPt.x;
+    const y = markerPt.y;
     const size = parseFloat(document.getElementById('size').value || '16');
     const text = document.getElementById('text').value;
     const anns = [];
     if(text) anns.push({ page, type:'text', x, y, size, text, color:[0.1,0.1,0.1] });
     if(imgInput.files[0]) anns.push({ page, type:'image', x, y, width:150 });
+    if(!anns.length) return toast('Preencha um texto ou escolha uma imagem.', true);
 
     const fd = new FormData();
     fd.append('fileId', fileId);
