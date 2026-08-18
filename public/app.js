@@ -368,7 +368,7 @@ RENDERERS['edit'] = (root)=>{
 
   let state = { pageCount:0, thumbs:[], order:[], rotations:{}, deleted:new Set() };
 
-  dz.onchange = async (files)=>{
+  dz.el.onchange = async (files)=>{
     if(files.length !== 1) return;
     grid.innerHTML = '<p class="hint">Carregando páginas…</p>';
     const fd = new FormData();
@@ -675,7 +675,7 @@ RENDERERS['annotate'] = (root)=>{
     }
   }
 
-  dz.onchange = async (files)=>{
+  dz.el.onchange = async (files)=>{
     if(files.length !== 1) return;
 
     info.textContent = 'Carregando PDF…';
@@ -712,9 +712,10 @@ RENDERERS['annotate'] = (root)=>{
       renderPage();
 
     }catch(e){
+      console.error('Erro ao carregar PDF:', e);
       toast(e.message, true);
       info.textContent = '';
-      status.textContent = '';
+      status.textContent = 'Erro ao carregar o PDF: ' + e.message;
     }
   };
 
