@@ -407,9 +407,18 @@ RENDERERS['edit'] = (root)=>{
 
 // ---------- Adicionar texto/imagem (editor visual: clique na página para posicionar) ----------
 RENDERERS['annotate'] = (root)=>{
-  const dz = makeDropzone(root, { accept:'.pdf', multiple:false, label:'Arraste um PDF' });
-  let fileId = null, pageCount = 0, pageSizes = [], thumbs = [], currentPage = 1;
-  let markerPt = null; // {x, y} em pontos do PDF, origem no topo-esquerdo
+  const dz = makeDropzone(root, {
+    accept: '.pdf',
+    multiple: false,
+    label: 'Arraste um PDF para editar'
+  });
+
+  let fileId = null;
+  let pageCount = 0;
+  let thumbs = [];
+  let currentPage = 1;
+  let textBoxes = [];
+  let edits = [];
 
   const info = document.createElement('p');
   info.className = 'hint';
@@ -420,127 +429,305 @@ RENDERERS['annotate'] = (root)=>{
   pageNav.innerHTML = `
     <button type="button" id="prevPage" class="btn-ghost">← Página anterior</button>
     <span id="pageIndicator" style="align-self:center;"></span>
-    <button type="button" id="nextPage" class="btn-ghost">Próxima página →</button>`;
+    <button type="button" id="nextPage" class="btn-ghost">Próxima página →</button>
+  `;
   root.appendChild(pageNav);
 
-  const previewWrap = document.createElement('div');
-  previewWrap.className = 'annotate-preview hidden';
-  previewWrap.style.cssText = 'position:relative;display:inline-block;max-width:100%;border:1px solid var(--line,#3a4552);cursor:crosshair;';
-  root.appendChild(previewWrap);
+  const editor = document.createElement('div');
+  editor.className = 'pdf-visual-editor hidden';
+  editor.style.cssText = `
+    position:relative;
+    display:block;
+    width:100%;
+    max-width:100%;
+    overflow:auto;
+    background:#777;
+    border:1px solid var(--line,#3a4552);
+    padding:12px;
+    box-sizing:border-box;
+  `;
+  root.appendChild(editor);
+
+  const pageCanvas = document.createElement('div');
+  pageCanvas.style.cssText = `
+    position:relative;
+    display:block;
+    width:max-content;
+    max-width:100%;
+    margin:0 auto;
+    line-height:0;
+  `;
+  editor.appendChild(pageCanvas);
 
   const previewImg = document.createElement('img');
-  previewImg.style.cssText = 'display:block;max-width:100%;height:auto;user-select:none;';
-  previewWrap.appendChild(previewImg);
+  previewImg.style.cssText = `
+    display:block;
+    max-width:100%;
+    height:auto;
+    user-select:none;
+  `;
+  pageCanvas.appendChild(previewImg);
 
-  const marker = document.createElement('div');
-  marker.style.cssText = 'position:absolute;width:14px;height:14px;border-radius:50%;background:var(--stamp,#c1442d);border:2px solid #fff;transform:translate(-50%,-50%);display:none;pointer-events:none;box-shadow:0 0 0 2px rgba(0,0,0,.3);';
-  previewWrap.appendChild(marker);
+  const textLayer = document.createElement('div');
+  textLayer.style.cssText = `
+    position:absolute;
+    inset:0;
+    pointer-events:none;
+  `;
+  pageCanvas.appendChild(textLayer);
 
-  const clickHint = document.createElement('p');
-  clickHint.className = 'hint hidden';
-  clickHint.textContent = 'Clique no ponto da página onde o texto/imagem deve aparecer.';
-  root.appendChild(clickHint);
+  const status = document.createElement('p');
+  status.className = 'hint';
+  status.textContent = 'Carregue um PDF para começar.';
+  root.appendChild(status);
+
+  function getScale(){
+    if(!previewImg.naturalWidth) return 1;
+    return previewImg.clientWidth / previewImg.naturalWidth;
+  }
+
+  function renderTextLayer(){
+    textLayer.innerHTML = '';
+
+    if(!previewImg.naturalWidth) return;
+
+    const scale = getScale();
+
+    textBoxes
+      .filter(t => t.page === currentPage)
+      .forEach(t => {
+        const changed = edits.find(e => e.id === t.id);
+        const value = changed ? changed.text : t.text;
+
+        const box = document.createElement('div');
+        box.textContent = value;
+        box.title = 'Clique para editar este texto';
+
+        box.style.cssText = `
+          position:absolute;
+          left:${t.x * scale}px;
+          top:${t.y * scale}px;
+          width:${Math.max(t.width * scale, 6)}px;
+          min-height:${Math.max(t.height * scale, 8)}px;
+          font-family:Arial,sans-serif;
+          font-size:${Math.max(t.height * 0.82 * scale, 8)}px;
+          line-height:1.05;
+          color:transparent;
+          background:rgba(255,235,59,.10);
+          border:1px solid rgba(193,68,45,.28);
+          border-radius:2px;
+          pointer-events:auto;
+          cursor:text;
+          overflow:hidden;
+          white-space:pre-wrap;
+          box-sizing:border-box;
+          padding:0;
+        `;
+
+        box.addEventListener('mouseenter', ()=>{
+          box.style.background = 'rgba(255,235,59,.25)';
+          box.style.borderColor = 'rgba(193,68,45,.75)';
+        });
+
+        box.addEventListener('mouseleave', ()=>{
+          box.style.background = 'rgba(255,235,59,.10)';
+          box.style.borderColor = 'rgba(193,68,45,.28)';
+        });
+
+        box.onclick = (ev)=>{
+          ev.stopPropagation();
+          startTextEdit(t, value, box);
+        };
+
+        textLayer.appendChild(box);
+      });
+  }
+
+  function startTextEdit(t, oldValue, box){
+    const input = document.createElement('textarea');
+
+    input.value = oldValue;
+
+    input.style.cssText = `
+      position:absolute;
+      z-index:1000;
+      left:${box.offsetLeft}px;
+      top:${box.offsetTop}px;
+      width:${Math.max(box.offsetWidth, 90)}px;
+      min-height:${Math.max(box.offsetHeight, 28)}px;
+      padding:3px 5px;
+      resize:both;
+      border:2px solid var(--stamp,#c1442d);
+      border-radius:4px;
+      background:#fff;
+      color:#111;
+      font-family:Arial,sans-serif;
+      font-size:${Math.max(t.height * 0.82 * getScale(), 10)}px;
+      line-height:1.1;
+      box-sizing:border-box;
+      pointer-events:auto;
+    `;
+
+    pageCanvas.appendChild(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+
+    function finish(save=true){
+      if(done) return;
+      done = true;
+
+      if(save){
+        const newValue = input.value;
+
+        if(newValue !== oldValue){
+          const existing = edits.find(e => e.id === t.id);
+
+          if(existing){
+            existing.text = newValue;
+          }else{
+            edits.push({
+              id: t.id,
+              page: t.page,
+              x: t.x,
+              y: t.y,
+              width: t.width,
+              height: t.height,
+              fontSize: t.fontSize || Math.max(t.height, 7),
+              text: newValue
+            });
+          }
+
+          status.textContent = 'Alteração marcada. Edite outros textos ou salve o PDF.';
+        }
+      }
+
+      input.remove();
+      renderTextLayer();
+    }
+
+    input.addEventListener('blur', ()=>finish(true));
+
+    input.addEventListener('keydown', e=>{
+      if(e.key === 'Escape'){
+        e.preventDefault();
+        finish(false);
+      }
+
+      if(e.key === 'Enter' && !e.shiftKey){
+        e.preventDefault();
+        input.blur();
+      }
+    });
+  }
 
   function renderPage(){
+    if(!thumbs.length) return;
+
+    previewImg.onload = ()=>{
+      requestAnimationFrame(renderTextLayer);
+    };
+
     previewImg.src = thumbs[currentPage - 1];
-    document.getElementById('pageIndicator').textContent = `Página ${currentPage} de ${pageCount}`;
-    document.getElementById('page').value = currentPage;
-    marker.style.display = 'none';
-    markerPt = null;
+
+    const indicator = document.getElementById('pageIndicator');
+    if(indicator){
+      indicator.textContent = `Página ${currentPage} de ${pageCount}`;
+    }
   }
 
   dz.onchange = async (files)=>{
     if(files.length !== 1) return;
-    info.textContent = 'Carregando…';
+
+    info.textContent = 'Carregando PDF…';
+    status.textContent = 'Lendo os textos do PDF…';
+
     const fd = new FormData();
     fd.append('file', files[0]);
+
     try{
       const res = await postForm('/api/inspect', fd);
       const data = await res.json();
-      fileId = data.fileId; pageCount = data.pageCount;
-      pageSizes = data.pageSizes; thumbs = data.thumbnails;
+
+      fileId = data.fileId;
+      pageCount = data.pageCount;
+      thumbs = data.thumbnails || [];
+      textBoxes = data.textBoxes || [];
+      edits = [];
       currentPage = 1;
-      info.textContent = `PDF carregado (${pageCount} página(s)). Clique na página abaixo para escolher onde o conteúdo vai aparecer.`;
+
+      editor.classList.remove('hidden');
       pageNav.classList.toggle('hidden', pageCount <= 1);
-      previewWrap.classList.remove('hidden');
-      clickHint.classList.remove('hidden');
+
+      info.textContent =
+        `PDF carregado (${pageCount} página(s)).`;
+
+      if(textBoxes.length){
+        status.textContent =
+          `${textBoxes.length} texto(s) encontrado(s). Clique diretamente em um texto para editar.`;
+      }else{
+        status.textContent =
+          'Nenhum texto foi encontrado. Se este PDF for escaneado como imagem, será necessário OCR.';
+      }
+
       renderPage();
-    }catch(e){ toast(e.message, true); info.textContent=''; }
+
+    }catch(e){
+      toast(e.message, true);
+      info.textContent = '';
+      status.textContent = '';
+    }
   };
 
-  previewWrap.addEventListener('click', (e)=>{
-    if(!thumbs.length) return;
-    const rect = previewImg.getBoundingClientRect();
-    const clickX = e.clientX - rect.left;
-    const clickY = e.clientY - rect.top;
-    const size = pageSizes[currentPage - 1];
-    // converte pixel clicado na imagem exibida -> ponto real do PDF (mesma escala, proporcional)
-    const ptX = (clickX / rect.width) * size.width;
-    const ptY = (clickY / rect.height) * size.height;
-    markerPt = { x: ptX, y: ptY };
-    marker.style.left = clickX + 'px';
-    marker.style.top = clickY + 'px';
-    marker.style.display = 'block';
-    document.getElementById('x').value = Math.round(ptX);
-    document.getElementById('y').value = Math.round(ptY);
+  window.addEventListener('resize', ()=>{
+    requestAnimationFrame(renderTextLayer);
   });
 
-  const row1 = document.createElement('div');
-  row1.className = 'field-row';
-  row1.innerHTML = `
-    <div class="field"><label>Página</label><input type="text" id="page" value="1" readonly></div>
-    <div class="field"><label>X (pontos)</label><input type="text" id="x" placeholder="clique na página"></div>
-    <div class="field"><label>Y (pontos, a partir do topo)</label><input type="text" id="y" placeholder="clique na página"></div>`;
-  root.appendChild(row1);
+  pageNav.querySelector('#prevPage').onclick = ()=>{
+    if(currentPage > 1){
+      currentPage--;
+      renderPage();
+    }
+  };
 
-  const row2 = document.createElement('div');
-  row2.className = 'field';
-  row2.innerHTML = `<label>Texto a inserir (deixe em branco se for só imagem)</label>
-    <input type="text" id="text" placeholder="Confidencial">`;
-  root.appendChild(row2);
+  pageNav.querySelector('#nextPage').onclick = ()=>{
+    if(currentPage < pageCount){
+      currentPage++;
+      renderPage();
+    }
+  };
 
-  const row3 = document.createElement('div');
-  row3.className = 'field-row';
-  row3.innerHTML = `<div class="field"><label>Tamanho do texto</label><input type="text" id="size" placeholder="16"></div>`;
-  root.appendChild(row3);
-
-  const imgField = document.createElement('div');
-  imgField.className = 'field';
-  imgField.innerHTML = `<label>Imagem/carimbo (opcional, PNG ou JPG)</label>`;
-  const imgInput = document.createElement('input');
-  imgInput.type = 'file'; imgInput.accept = 'image/png,image/jpeg';
-  imgField.appendChild(imgInput);
-  root.appendChild(imgField);
-
-  document.getElementById('prevPage').onclick = ()=>{ if(currentPage>1){ currentPage--; renderPage(); } };
-  document.getElementById('nextPage').onclick = ()=>{ if(currentPage<pageCount){ currentPage++; renderPage(); } };
-
-  const btn = makeButton(root, 'Inserir e baixar PDF');
+  const btn = makeButton(root, 'Salvar PDF editado');
   btn.dataset.label = btn.textContent;
+
   btn.onclick = async ()=>{
-    if(!fileId) return toast('Envie um PDF primeiro.', true);
-    if(!markerPt) return toast('Clique na página para escolher onde o conteúdo vai aparecer.', true);
-    const page = currentPage;
-    const x = markerPt.x;
-    const y = markerPt.y;
-    const size = parseFloat(document.getElementById('size').value || '16');
-    const text = document.getElementById('text').value;
-    const anns = [];
-    if(text) anns.push({ page, type:'text', x, y, size, text, color:[0.1,0.1,0.1] });
-    if(imgInput.files[0]) anns.push({ page, type:'image', x, y, width:150 });
-    if(!anns.length) return toast('Preencha um texto ou escolha uma imagem.', true);
+    if(!fileId){
+      return toast('Envie um PDF primeiro.', true);
+    }
+
+    if(!edits.length){
+      return toast('Nenhuma alteração foi feita.', true);
+    }
 
     const fd = new FormData();
     fd.append('fileId', fileId);
-    fd.append('annotations', JSON.stringify(anns));
-    if(imgInput.files[0]) fd.append('image', imgInput.files[0]);
+    fd.append('annotations', JSON.stringify(edits));
 
-    setLoading(btn,true,'Inserindo…');
+    setLoading(btn, true, 'Salvando PDF…');
+
     try{
       const res = await postForm('/api/edit/annotate', fd);
-      downloadBlob(await res.blob(), 'editado.pdf');
-      toast('Conteúdo inserido com sucesso!');
-    }catch(e){ toast(e.message, true); }
-    setLoading(btn,false);
+      const blob = await res.blob();
+
+      downloadBlob(blob, 'editado.pdf');
+
+      toast('PDF editado e baixado com sucesso!');
+    }catch(e){
+      toast(e.message, true);
+    }
+
+    setLoading(btn, false);
   };
 };
+
