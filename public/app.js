@@ -116,75 +116,20 @@ function setLoading(btn, loading, text){
 
 async function postForm(url, formData){
   const res = await fetch(url, { method:'POST', body: formData });
-
   if(!res.ok){
     let msg = 'Falha ao processar o arquivo.';
-
-    try{
-      const type = res.headers.get('content-type') || '';
-
-      if(type.includes('application/json')){
-        const data = await res.json();
-        msg = data.error || msg;
-      }else{
-        const text = await res.text();
-        if(text) msg = text.slice(0, 500);
-      }
-    }catch(_){}
-
+    try{ msg = (await res.json()).error || msg; }catch(_){}
     throw new Error(msg);
   }
-
   return res;
 }
 
 function downloadBlob(blob, filename){
-  if(!blob || blob.size === 0){
-    throw new Error('O servidor não retornou um arquivo válido.');
-  }
-
-  const dot = filename.lastIndexOf('.');
-  const defaultName = dot > 0 ? filename.slice(0, dot) : filename;
-  const extension = dot > 0 ? filename.slice(dot) : '';
-
-  let chosen = window.prompt(
-    'Digite o nome do arquivo antes de baixar:',
-    defaultName
-  );
-
-  if(chosen === null){
-    return false;
-  }
-
-  chosen = chosen.trim();
-
-  if(!chosen){
-    chosen = defaultName;
-  }
-
-  // Remove caracteres que o Windows não aceita em nomes de arquivos.
-  chosen = chosen.replace(/[\\/:*?"<>|]/g, '_');
-
-  if(extension && !chosen.toLowerCase().endsWith(extension.toLowerCase())){
-    chosen += extension;
-  }
-
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-
-  a.href = url;
-  a.download = chosen;
-  a.style.display = 'none';
-
-  document.body.appendChild(a);
-  a.click();
-
-  setTimeout(()=>{
-    a.remove();
-    URL.revokeObjectURL(url);
-  }, 1000);
-
-  return true;
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // ---------- RENDERERS ----------
@@ -368,7 +313,7 @@ RENDERERS['edit'] = (root)=>{
 
   let state = { pageCount:0, thumbs:[], order:[], rotations:{}, deleted:new Set() };
 
-  dz.el.onchange = async (files)=>{
+  dz.onchange = async (files)=>{
     if(files.length !== 1) return;
     grid.innerHTML = '<p class="hint">Carregando páginas…</p>';
     const fd = new FormData();
@@ -435,17 +380,19 @@ RENDERERS['edit'] = (root)=>{
 // ---------- Adicionar texto/imagem (editor visual: clique na página para posicionar) ----------
 RENDERERS['annotate'] = (root)=>{
   const dz = makeDropzone(root, {
-    accept: '.pdf',
-    multiple: false,
-    label: 'Arraste um PDF para editar'
+    accept:'.pdf',
+    multiple:false,
+    label:'Arraste um PDF para editar'
   });
 
   let fileId = null;
   let pageCount = 0;
+  let pageSizes = [];
   let thumbs = [];
-  let currentPage = 1;
   let textBoxes = [];
-  let edits = [];
+  let currentPage = 1;
+  let selectedId = null;
+  const edits = new Map();
 
   const info = document.createElement('p');
   info.className = 'hint';
@@ -454,44 +401,51 @@ RENDERERS['annotate'] = (root)=>{
   const pageNav = document.createElement('div');
   pageNav.className = 'field-row hidden';
   pageNav.innerHTML = `
-    <button type="button" id="prevPage" class="btn-ghost">← Página anterior</button>
-    <span id="pageIndicator" style="align-self:center;"></span>
-    <button type="button" id="nextPage" class="btn-ghost">Próxima página →</button>
-  `;
+    <button type="button" id="prevPage">← Página anterior</button>
+    <span id="pageIndicator" style="align-self:center"></span>
+    <button type="button" id="nextPage">Próxima página →</button>`;
   root.appendChild(pageNav);
 
-  const editor = document.createElement('div');
-  editor.className = 'pdf-visual-editor hidden';
-  editor.style.cssText = `
+  const help = document.createElement('p');
+  help.className = 'hint';
+  help.textContent =
+    'O PDF aparece abaixo. Clique diretamente em qualquer texto para selecionar e editar ou excluir.';
+  root.appendChild(help);
+
+  // Container for the real PDF page image.
+  const previewWrap = document.createElement('div');
+  previewWrap.style.cssText = `
     position:relative;
     display:block;
     width:100%;
-    max-width:100%;
+    max-width:1100px;
     overflow:auto;
     background:#777;
-    border:1px solid var(--line,#3a4552);
-    padding:12px;
+    border:1px solid rgba(255,255,255,.18);
+    padding:10px;
     box-sizing:border-box;
+    min-height:120px;
   `;
-  root.appendChild(editor);
+  root.appendChild(previewWrap);
 
   const pageCanvas = document.createElement('div');
   pageCanvas.style.cssText = `
     position:relative;
-    display:block;
     width:max-content;
     max-width:100%;
     margin:0 auto;
     line-height:0;
   `;
-  editor.appendChild(pageCanvas);
+  previewWrap.appendChild(pageCanvas);
 
   const previewImg = document.createElement('img');
+  previewImg.alt = 'Pré-visualização do PDF';
   previewImg.style.cssText = `
     display:block;
     max-width:100%;
     height:auto;
     user-select:none;
+    pointer-events:none;
   `;
   pageCanvas.appendChild(previewImg);
 
@@ -503,384 +457,278 @@ RENDERERS['annotate'] = (root)=>{
   `;
   pageCanvas.appendChild(textLayer);
 
-  const status = document.createElement('p');
-  status.className = 'hint';
-  status.textContent = 'Carregue um PDF para começar.';
-  root.appendChild(status);
+  const selected = document.createElement('p');
+  selected.className = 'hint';
+  selected.textContent = 'Nenhum texto selecionado.';
+  root.appendChild(selected);
 
-  function getScale(){
+  const actionRow = document.createElement('div');
+  actionRow.className = 'field-row';
+
+  const editBtn = makeButton(actionRow, 'Editar texto selecionado');
+  editBtn.disabled = true;
+  editBtn.dataset.label = editBtn.textContent;
+
+  const deleteBtn = makeButton(actionRow, 'Excluir texto selecionado');
+  deleteBtn.disabled = true;
+  deleteBtn.dataset.label = deleteBtn.textContent;
+
+  const clearBtn = document.createElement('button');
+  clearBtn.type = 'button';
+  clearBtn.textContent = 'Limpar seleção';
+  actionRow.appendChild(clearBtn);
+
+  root.appendChild(actionRow);
+
+  function scale(){
     if(!previewImg.naturalWidth) return 1;
     return previewImg.clientWidth / previewImg.naturalWidth;
   }
 
-  function renderTextLayer(){
-    textLayer.innerHTML = '';
-
-    if(!previewImg.naturalWidth) return;
-
-    const scale = getScale();
-
-    textBoxes
-      .filter(t => t.page === currentPage)
-      .forEach(t => {
-        const changed = edits.find(e => e.id === t.id);
-
-        if(changed && changed.deleted){
-          return;
-        }
-
-        const value = changed ? changed.text : t.text;
-
-        const box = document.createElement('div');
-        box.textContent = value;
-        box.title = 'Clique para editar este texto';
-
-        box.style.cssText = `
-          position:absolute;
-          left:${t.x * scale}px;
-          top:${t.y * scale}px;
-          width:${Math.max(t.width * scale, 3)}px;
-          height:${Math.max(t.height * scale, 6)}px;
-          min-height:0;
-          font-family:Arial,sans-serif;
-          font-size:${Math.max(t.height * 0.82 * scale, 8)}px;
-          line-height:1.05;
-          color:transparent;
-          background:rgba(255,235,59,.10);
-          border:1px solid rgba(193,68,45,.28);
-          border-radius:2px;
-          pointer-events:auto;
-          cursor:text;
-          overflow:hidden;
-          white-space:pre-wrap;
-          box-sizing:border-box;
-          padding:0;
-        `;
-
-        box.addEventListener('mouseenter', ()=>{
-          box.style.background = 'rgba(255,235,59,.25)';
-          box.style.borderColor = 'rgba(193,68,45,.75)';
-        });
-
-        box.addEventListener('mouseleave', ()=>{
-          box.style.background = 'rgba(255,235,59,.10)';
-          box.style.borderColor = 'rgba(193,68,45,.28)';
-        });
-
-        box.onclick = (ev)=>{
-          ev.stopPropagation();
-          startTextEdit(t, value, box);
-        };
-
-        textLayer.appendChild(box);
-      });
+  function selectedBox(){
+    return textBoxes.find(t => t.id === selectedId) || null;
   }
 
-  function startTextEdit(t, oldValue, box){
-    // Remove any editor that may already be open.
-    pageCanvas.querySelectorAll('.pdf-text-editor').forEach(el => el.remove());
-
-    const panel = document.createElement('div');
-    panel.className = 'pdf-text-editor';
-
-    panel.style.cssText = `
-      position:absolute;
-      z-index:10000;
-      left:${Math.max(0, box.offsetLeft)}px;
-      top:${Math.max(0, box.offsetTop + box.offsetHeight + 6)}px;
-      width:280px;
-      max-width:calc(100% - 10px);
-      padding:10px;
-      background:#fff;
-      color:#111;
-      border:2px solid #c1442d;
-      border-radius:6px;
-      box-shadow:0 8px 25px rgba(0,0,0,.35);
-      box-sizing:border-box;
-      line-height:normal;
-    `;
-
-    const title = document.createElement('div');
-    title.textContent = 'Editar texto';
-    title.style.cssText = `
-      font-weight:700;
-      margin-bottom:7px;
-      font-family:Arial,sans-serif;
-      font-size:13px;
-    `;
-    panel.appendChild(title);
-
-    const input = document.createElement('textarea');
-    input.value = oldValue;
-    input.style.cssText = `
-      display:block;
-      width:100%;
-      min-height:70px;
-      padding:7px;
-      resize:vertical;
-      border:1px solid #999;
-      border-radius:4px;
-      background:#fff;
-      color:#111;
-      font-family:Arial,sans-serif;
-      font-size:14px;
-      line-height:1.2;
-      box-sizing:border-box;
-    `;
-    panel.appendChild(input);
-
-    const buttons = document.createElement('div');
-    buttons.style.cssText = `
-      display:flex;
-      gap:6px;
-      margin-top:8px;
-      justify-content:flex-end;
-      flex-wrap:wrap;
-    `;
-
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'button';
-    saveBtn.textContent = 'Salvar';
-    saveBtn.style.cssText = `
-      padding:6px 12px;
-      border:0;
-      border-radius:4px;
-      cursor:pointer;
-      background:#c1442d;
-      color:#fff;
-      font-weight:700;
-    `;
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.type = 'button';
-    deleteBtn.textContent = 'Excluir';
-    deleteBtn.style.cssText = `
-      padding:6px 12px;
-      border:0;
-      border-radius:4px;
-      cursor:pointer;
-      background:#8b1e1e;
-      color:#fff;
-      font-weight:700;
-    `;
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.type = 'button';
-    cancelBtn.textContent = 'Cancelar';
-    cancelBtn.style.cssText = `
-      padding:6px 12px;
-      border:1px solid #aaa;
-      border-radius:4px;
-      cursor:pointer;
-      background:#eee;
-      color:#222;
-      font-weight:600;
-    `;
-
-    buttons.append(saveBtn, deleteBtn, cancelBtn);
-    panel.appendChild(buttons);
-    pageCanvas.appendChild(panel);
-
-    input.focus();
-    input.select();
-
-    function close(){
-      panel.remove();
-      renderTextLayer();
+  function updateSelection(){
+    const t = selectedBox();
+    if(!t){
+      selected.textContent = 'Nenhum texto selecionado.';
+      editBtn.disabled = true;
+      deleteBtn.disabled = true;
+      return;
     }
 
-    function findEdit(){
-      return edits.find(e => e.id === t.id);
+    const e = edits.get(t.id);
+    selected.textContent =
+      `Selecionado: "${e ? (e.deleted ? '[excluir]' : e.text) : t.text}" — página ${t.page}`;
+    editBtn.disabled = false;
+    deleteBtn.disabled = false;
+  }
+
+  function renderTextLayer(){
+    textLayer.innerHTML = '';
+    const s = scale();
+
+    for(const t of textBoxes){
+      if(t.page !== currentPage) continue;
+
+      const e = edits.get(t.id);
+      const isDeleted = !!(e && e.deleted);
+      const isChanged = !!(e && !e.deleted);
+      const value = isDeleted ? '' : (e ? e.text : t.text);
+
+      const box = document.createElement('div');
+      box.textContent = value;
+      box.title = isDeleted
+        ? 'Marcado para exclusão'
+        : 'Clique para selecionar este texto';
+
+      box.style.cssText = `
+        position:absolute;
+        left:${t.x * s}px;
+        top:${t.y * s}px;
+        width:${Math.max(t.width * s, 5)}px;
+        height:${Math.max(t.height * s, 8)}px;
+        box-sizing:border-box;
+        overflow:hidden;
+        white-space:pre-wrap;
+        font-family:Arial,sans-serif;
+        font-size:${Math.max(t.height * .82 * s, 8)}px;
+        line-height:1.05;
+        color:${isChanged ? '#111' : 'transparent'};
+        background:${isDeleted || isChanged ? '#fff' : 'rgba(255,235,59,.08)'};
+        border:${selectedId === t.id
+          ? '2px solid #1976d2'
+          : (isDeleted ? '2px solid #8b1e1e' : (isChanged ? '1px solid #c1442d' : '1px solid rgba(193,68,45,.22)'))};
+        padding:${isChanged ? '1px' : '0'};
+        cursor:pointer;
+        pointer-events:auto;
+        z-index:${selectedId === t.id ? 30 : (isChanged || isDeleted ? 10 : 2)};
+      `;
+
+      box.addEventListener('click', (ev)=>{
+        ev.preventDefault();
+        ev.stopPropagation();
+        selectedId = t.id;
+        updateSelection();
+        renderTextLayer();
+      });
+
+      textLayer.appendChild(box);
     }
 
-    function saveText(){
-      const newValue = input.value;
-
-      let existing = findEdit();
-
-      if(existing){
-        existing.text = newValue;
-        existing.deleted = false;
-      }else{
-        edits.push({
-          id: t.id,
-          page: t.page,
-          x: t.x,
-          y: t.y,
-          width: t.width,
-          height: t.height,
-          fontSize: t.fontSize || Math.max(t.height, 7),
-          text: newValue,
-          deleted: false
-        });
-      }
-
-      status.textContent =
-        'Texto alterado. Você pode editar ou excluir outro texto.';
-
-      close();
-    }
-
-    function deleteText(){
-      let existing = findEdit();
-
-      if(existing){
-        existing.deleted = true;
-        existing.text = '';
-      }else{
-        edits.push({
-          id: t.id,
-          page: t.page,
-          x: t.x,
-          y: t.y,
-          width: t.width,
-          height: t.height,
-          fontSize: t.fontSize || Math.max(t.height, 7),
-          text: '',
-          deleted: true
-        });
-      }
-
-      status.textContent =
-        'Texto excluído. Ele será removido do PDF ao salvar.';
-
-      close();
-    }
-
-    saveBtn.onclick = saveText;
-    deleteBtn.onclick = deleteText;
-    cancelBtn.onclick = close;
-
-    input.addEventListener('keydown', e => {
-      if(e.key === 'Escape'){
-        e.preventDefault();
-        close();
-      }
-
-      if(e.key === 'Enter' && e.ctrlKey){
-        e.preventDefault();
-        saveText();
-      }
-    });
+    updateSelection();
   }
 
   function renderPage(){
     if(!thumbs.length) return;
 
-    const previewUrl = thumbs[currentPage - 1];
+    const url = new URL(thumbs[currentPage - 1], window.location.origin).href;
 
     previewImg.onload = ()=>{
+      previewWrap.style.display = 'block';
+      info.textContent =
+        `Página ${currentPage} carregada. Clique diretamente nos textos para editar ou excluir.`;
       requestAnimationFrame(renderTextLayer);
     };
 
     previewImg.onerror = ()=>{
-      console.error('Erro ao carregar a página do PDF:', previewUrl);
-      status.textContent =
-        'Não foi possível carregar a página do PDF. Tente recarregar a página.';
+      info.textContent =
+        'Não foi possível renderizar esta página. Tente recarregar o PDF.';
+      textLayer.innerHTML = '';
     };
 
-    previewImg.src = new URL(
-      previewUrl,
-      window.location.origin
-    ).href;
+    previewImg.src = url;
 
-    const indicator = document.getElementById('pageIndicator');
-    if(indicator){
-      indicator.textContent = `Página ${currentPage} de ${pageCount}`;
-    }
+    document.getElementById('pageIndicator').textContent =
+      `Página ${currentPage} de ${pageCount}`;
   }
 
-  dz.el.onchange = async (files)=>{
+  dz.onchange = async (files)=>{
     if(files.length !== 1) return;
 
-    info.textContent = 'Carregando PDF…';
-    status.textContent = 'Lendo os textos do PDF…';
+    info.textContent = 'PDF carregado. Renderizando a primeira página…';
+    selectedId = null;
+    edits.clear();
+    textBoxes = [];
+    thumbs = [];
 
     const fd = new FormData();
     fd.append('file', files[0]);
 
     try{
       const res = await postForm('/api/inspect', fd);
+      if(!res.ok) throw new Error(await res.text());
+
       const data = await res.json();
 
       fileId = data.fileId;
       pageCount = data.pageCount;
+      pageSizes = data.pageSizes || [];
       thumbs = data.thumbnails || [];
       textBoxes = data.textBoxes || [];
-      edits = [];
       currentPage = 1;
 
-      editor.classList.remove('hidden');
-      pageNav.classList.toggle('hidden', pageCount <= 1);
-
-      info.textContent =
-        `PDF carregado (${pageCount} página(s)).`;
-
-      if(textBoxes.length){
-        status.textContent =
-          `${textBoxes.length} texto(s) encontrado(s). Clique diretamente em um texto para editar.`;
-      }else{
-        status.textContent =
-          'Nenhum texto foi encontrado. Se este PDF for escaneado como imagem, será necessário OCR.';
+      if(!thumbs.length){
+        throw new Error('O servidor não retornou as páginas do PDF.');
       }
 
+      info.textContent =
+        `PDF carregado: ${pageCount} página(s). ${textBoxes.length} texto(s) encontrados.`;
+
+      pageNav.classList.toggle('hidden', pageCount <= 1);
       renderPage();
 
     }catch(e){
-      console.error('Erro ao carregar PDF:', e);
-      toast(e.message, true);
-      info.textContent = '';
-      status.textContent = 'Erro ao carregar o PDF: ' + e.message;
+      console.error(e);
+      info.textContent = 'Erro ao carregar o PDF.';
+      toast(e.message || 'Não foi possível carregar o PDF.', true);
     }
   };
 
-  window.addEventListener('resize', ()=>{
-    requestAnimationFrame(renderTextLayer);
-  });
-
-  pageNav.querySelector('#prevPage').onclick = ()=>{
+  document.getElementById('prevPage').onclick = ()=>{
     if(currentPage > 1){
       currentPage--;
+      selectedId = null;
       renderPage();
     }
   };
 
-  pageNav.querySelector('#nextPage').onclick = ()=>{
+  document.getElementById('nextPage').onclick = ()=>{
     if(currentPage < pageCount){
       currentPage++;
+      selectedId = null;
       renderPage();
     }
   };
 
-  const btn = makeButton(root, 'Salvar PDF editado');
-  btn.dataset.label = btn.textContent;
+  editBtn.onclick = ()=>{
+    const t = selectedBox();
+    if(!t) return;
 
-  btn.onclick = async ()=>{
-    if(!fileId){
-      return toast('Envie um PDF primeiro.', true);
-    }
+    const old = edits.get(t.id);
+    const oldText = old && !old.deleted ? old.text : t.text;
 
-    if(!edits.length){
-      return toast('Nenhuma alteração foi feita.', true);
-    }
+    const value = window.prompt('Digite o novo texto:', oldText);
+    if(value === null) return;
+
+    edits.set(t.id, {
+      id:t.id,
+      page:t.page,
+      x:t.pdfX ?? t.x,
+      y:t.pdfY ?? t.y,
+      width:t.pdfWidth ?? t.width,
+      height:t.pdfHeight ?? t.height,
+      fontSize:t.fontSize || Math.max(7, t.height),
+      originalText:t.originalText || t.text || '',
+      text:value,
+      deleted:false
+    });
+
+    info.textContent =
+      'Pré-visualização atualizada. Continue editando ou excluindo outros textos.';
+    renderTextLayer();
+  };
+
+  deleteBtn.onclick = ()=>{
+    const t = selectedBox();
+    if(!t) return;
+
+    edits.set(t.id, {
+      id:t.id,
+      page:t.page,
+      x:t.pdfX ?? t.x,
+      y:t.pdfY ?? t.y,
+      width:t.pdfWidth ?? t.pdfWidth ?? t.width,
+      height:t.pdfHeight ?? t.height,
+      fontSize:t.fontSize || Math.max(7, t.height),
+      originalText:t.originalText || t.text || '',
+      text:'',
+      deleted:true
+    });
+
+    info.textContent =
+      'Texto marcado para exclusão e removido da pré-visualização.';
+    renderTextLayer();
+  };
+
+  clearBtn.onclick = ()=>{
+    selectedId = null;
+    renderTextLayer();
+  };
+
+  const saveBtn = makeButton(root, 'Salvar PDF editado');
+  saveBtn.dataset.label = saveBtn.textContent;
+
+  saveBtn.onclick = async ()=>{
+    if(!fileId) return toast('Envie um PDF primeiro.', true);
+    if(!edits.size) return toast('Faça pelo menos uma edição ou exclusão.', true);
 
     const fd = new FormData();
     fd.append('fileId', fileId);
-    fd.append('annotations', JSON.stringify(edits));
+    fd.append('annotations', JSON.stringify([...edits.values()]));
 
-    setLoading(btn, true, 'Salvando PDF…');
+    setLoading(saveBtn, true, 'Gerando PDF…');
 
     try{
       const res = await postForm('/api/edit/annotate', fd);
-      const blob = await res.blob();
+      if(!res.ok){
+        let msg = 'Falha ao gerar o PDF.';
+        try{
+          const j = await res.json();
+          msg = j.error || msg;
+        }catch{}
+        throw new Error(msg);
+      }
 
-      downloadBlob(blob, 'editado.pdf');
-
-      toast('PDF editado e baixado com sucesso!');
+      downloadBlob(await res.blob(), 'editado.pdf');
+      toast('PDF editado com sucesso!');
     }catch(e){
+      console.error(e);
       toast(e.message, true);
     }
 
-    setLoading(btn, false);
+    setLoading(saveBtn, false);
   };
 };
+
