@@ -1,0 +1,305 @@
+const express = require('express');
+const multer = require('multer');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const { v4: uuid } = require('uuid');
+const archiver = require('archiver');
+const { execFile } = require('child_process');
+const { PDFDocument, degrees, rgb, StandardFonts } = require('pdf-lib');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const UP = path.join(__dirname, 'uploads');
+const TMP = path.join(__dirname, 'tmp');
+[UP, TMP].forEach(d => fs.mkdirSync(d, { recursive: true }));
+
+app.use(cors());
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UP),
+    filename: (req, file, cb) => cb(null, uuid() + path.extname(file.originalname))
+  }),
+  limits: { fileSize: 200 * 1024 * 1024 } // 200MB
+});
+
+// ---------- helpers ----------
+
+function run(cmd, args) {
+  return new Promise((resolve, reject) => {
+    execFile(cmd, args, { maxBuffer: 1024 * 1024 * 200 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout);
+    });
+  });
+}
+
+function cleanup(...files) {
+  files.forEach(f => {
+    if (!f) return;
+    fs.rm(f, { recursive: true, force: true }, () => {});
+  });
+}
+
+function parseRanges(str, pageCount) {
+  // "1-3,5,7-8" -> array of arrays of 0-indexed page numbers, one group per PDF output
+  return str.split(',').map(s => s.trim()).filter(Boolean).map(part => {
+    const [a, b] = part.split('-').map(n => parseInt(n, 10));
+    const start = Math.max(1, a);
+    const end = Math.min(pageCount, b || a);
+    const arr = [];
+    for (let i = start; i <= end; i++) arr.push(i - 1);
+    return arr;
+  });
+}
+
+function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
+  res.download(filePath, downloadName, (err) => {
+    cleanup(filePath, ...extraFiles);
+  });
+}
+
+// ---------- MERGE ----------
+app.post('/api/merge', upload.array('files'), async (req, res) => {
+  const inputs = req.files.map(f => f.path);
+  try {
+    const merged = await PDFDocument.create();
+    for (const file of req.files) {
+      const bytes = fs.readFileSync(file.path);
+      const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+      const pages = await merged.copyPages(src, src.getPageIndices());
+      pages.forEach(p => merged.addPage(p));
+    }
+    const outBytes = await merged.save();
+    const outPath = path.join(TMP, uuid() + '.pdf');
+    fs.writeFileSync(outPath, outBytes);
+    sendFileAndCleanup(res, outPath, 'unido.pdf', inputs);
+  } catch (e) {
+    cleanup(...inputs);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- SPLIT ----------
+app.post('/api/split', upload.single('file'), async (req, res) => {
+  const inputPath = req.file.path;
+  try {
+    const bytes = fs.readFileSync(inputPath);
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const pageCount = src.getPageCount();
+    const ranges = req.body.ranges
+      ? parseRanges(req.body.ranges, pageCount)
+      : src.getPageIndices().map(i => [i]); // no ranges = one PDF per page
+
+    const zipPath = path.join(TMP, uuid() + '.zip');
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip');
+    archive.pipe(output);
+
+    for (let i = 0; i < ranges.length; i++) {
+      const doc = await PDFDocument.create();
+      const pages = await doc.copyPages(src, ranges[i]);
+      pages.forEach(p => doc.addPage(p));
+      const outBytes = await doc.save();
+      archive.append(Buffer.from(outBytes), { name: `parte_${i + 1}.pdf` });
+    }
+    await archive.finalize();
+    output.on('close', () => sendFileAndCleanup(res, zipPath, 'partes.zip', [inputPath]));
+  } catch (e) {
+    cleanup(inputPath);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- PAGE OPS: delete / rotate / reorder ----------
+app.post('/api/pages/edit', upload.single('file'), async (req, res) => {
+  // body: operations = JSON { keepOrder: [1,3,2], rotations: {"1": 90}, delete: [4] }
+  const inputPath = req.file.path;
+  try {
+    const bytes = fs.readFileSync(inputPath);
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const pageCount = src.getPageCount();
+    const ops = JSON.parse(req.body.operations || '{}');
+    const deleteSet = new Set((ops.delete || []).map(n => n - 1));
+    let order = ops.keepOrder ? ops.keepOrder.map(n => n - 1) : src.getPageIndices();
+    order = order.filter(i => !deleteSet.has(i));
+
+    const out = await PDFDocument.create();
+    const pages = await out.copyPages(src, order);
+    pages.forEach((p, idx) => {
+      const originalPageNum = order[idx] + 1;
+      const rot = ops.rotations && ops.rotations[originalPageNum];
+      if (rot) p.setRotation(degrees((p.getRotation().angle + rot) % 360));
+      out.addPage(p);
+    });
+    const outBytes = await out.save();
+    const outPath = path.join(TMP, uuid() + '.pdf');
+    fs.writeFileSync(outPath, outBytes);
+    sendFileAndCleanup(res, outPath, 'editado.pdf', [inputPath]);
+  } catch (e) {
+    cleanup(inputPath);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- COMPRESS (ghostscript) ----------
+app.post('/api/compress', upload.single('file'), async (req, res) => {
+  const inputPath = req.file.path;
+  const level = req.body.level || 'ebook'; // screen | ebook | printer
+  const outPath = path.join(TMP, uuid() + '.pdf');
+  try {
+    await run('gs', [
+      '-sDEVICE=pdfwrite', '-dCompatibilityLevel=1.4',
+      `-dPDFSETTINGS=/${level}`,
+      '-dNOPAUSE', '-dQUIET', '-dBATCH',
+      `-sOutputFile=${outPath}`, inputPath
+    ]);
+    sendFileAndCleanup(res, outPath, 'comprimido.pdf', [inputPath]);
+  } catch (e) {
+    cleanup(inputPath, outPath);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- CONVERT: images -> pdf ----------
+app.post('/api/convert/images-to-pdf', upload.array('files'), async (req, res) => {
+  const inputs = req.files.map(f => f.path);
+  try {
+    const sharp = require('sharp');
+    const doc = await PDFDocument.create();
+    for (const file of req.files) {
+      const buf = await sharp(file.path).jpeg({ quality: 90 }).toBuffer();
+      const img = await doc.embedJpg(buf);
+      const page = doc.addPage([img.width, img.height]);
+      page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+    }
+    const outBytes = await doc.save();
+    const outPath = path.join(TMP, uuid() + '.pdf');
+    fs.writeFileSync(outPath, outBytes);
+    sendFileAndCleanup(res, outPath, 'imagens.pdf', inputs);
+  } catch (e) {
+    cleanup(...inputs);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- CONVERT: pdf -> images (poppler) ----------
+app.post('/api/convert/pdf-to-images', upload.single('file'), async (req, res) => {
+  const inputPath = req.file.path;
+  const format = (req.body.format || 'png').toLowerCase();
+  const workDir = path.join(TMP, uuid());
+  fs.mkdirSync(workDir);
+  try {
+    const flag = format === 'jpg' || format === 'jpeg' ? '-jpeg' : '-png';
+    await run('pdftoppm', [flag, '-r', '150', inputPath, path.join(workDir, 'page')]);
+    const zipPath = path.join(TMP, uuid() + '.zip');
+    const output = fs.createWriteStream(zipPath);
+    const archive = archiver('zip');
+    archive.pipe(output);
+    fs.readdirSync(workDir).forEach(f => archive.file(path.join(workDir, f), { name: f }));
+    await archive.finalize();
+    output.on('close', () => sendFileAndCleanup(res, zipPath, 'paginas.zip', [inputPath, workDir]));
+  } catch (e) {
+    cleanup(inputPath, workDir);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- CONVERT: office <-> pdf (LibreOffice headless) ----------
+app.post('/api/convert/office', upload.single('file'), async (req, res) => {
+  // target: pdf | docx | pptx | xlsx | odt
+  const inputPath = req.file.path;
+  const target = (req.body.target || 'pdf').toLowerCase();
+  const workDir = path.join(TMP, uuid());
+  fs.mkdirSync(workDir);
+  try {
+    const args = ['--headless', '--norestore'];
+    // Converting FROM pdf TO an editable format needs an explicit import filter,
+    // otherwise LibreOffice can't find an export chain and silently fails.
+    if (path.extname(inputPath).toLowerCase() === '.pdf' && target !== 'pdf') {
+      args.push('--infilter=writer_pdf_import');
+    }
+    args.push('--convert-to', target, '--outdir', workDir, inputPath);
+    await run('soffice', args);
+    const produced = fs.readdirSync(workDir)[0];
+    if (!produced) throw new Error('A conversão não gerou saída. Verifique o formato do arquivo.');
+    const outPath = path.join(workDir, produced);
+    sendFileAndCleanup(res, outPath, produced, [inputPath, workDir]);
+  } catch (e) {
+    cleanup(inputPath, workDir);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ---------- INSPECT: page count + thumbnails for the editor ----------
+app.post('/api/inspect', upload.single('file'), async (req, res) => {
+  const inputPath = req.file.path;
+  const id = uuid();
+  const workDir = path.join(UP, 'thumbs_' + id);
+  fs.mkdirSync(workDir);
+  try {
+    const bytes = fs.readFileSync(inputPath);
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const pageCount = src.getPageCount();
+    await run('pdftoppm', ['-png', '-r', '60', inputPath, path.join(workDir, 'p')]);
+    const files = fs.readdirSync(workDir).sort();
+    const finalName = id + '.pdf';
+    fs.copyFileSync(inputPath, path.join(UP, finalName));
+    res.json({
+      fileId: finalName,
+      pageCount,
+      thumbnails: files.map((f, i) => `/uploads/thumbs_${id}/${f}`)
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  } finally {
+    cleanup(inputPath);
+  }
+});
+app.use('/uploads', express.static(UP));
+
+// ---------- EDIT: add text / image overlay ----------
+app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
+  // body: fileId (from /api/inspect), annotations = JSON array
+  // annotation: { page, type:'text'|'image', x, y, size, text, color, width }
+  try {
+    const { fileId, annotations } = req.body;
+    const filePath = path.join(UP, fileId);
+    if (!fs.existsSync(filePath)) return res.status(400).json({ error: 'Arquivo não encontrado. Reenvie o PDF.' });
+    const bytes = fs.readFileSync(filePath);
+    const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+    const anns = JSON.parse(annotations || '[]');
+
+    for (const a of anns) {
+      const page = doc.getPage(a.page - 1);
+      const { height } = page.getSize();
+      if (a.type === 'text') {
+        page.drawText(a.text || '', {
+          x: a.x, y: height - a.y, size: a.size || 16, font,
+          color: rgb(...(a.color || [0, 0, 0]))
+        });
+      } else if (a.type === 'image' && req.file) {
+        const imgBytes = fs.readFileSync(req.file.path);
+        const img = req.file.mimetype.includes('png')
+          ? await doc.embedPng(imgBytes)
+          : await doc.embedJpg(imgBytes);
+        const w = a.width || img.width;
+        const h = (w / img.width) * img.height;
+        page.drawImage(img, { x: a.x, y: height - a.y - h, width: w, height: h });
+      }
+    }
+    const outBytes = await doc.save();
+    const outPath = path.join(TMP, uuid() + '.pdf');
+    fs.writeFileSync(outPath, outBytes);
+    sendFileAndCleanup(res, outPath, 'editado.pdf', req.file ? [req.file.path] : []);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.listen(PORT, () => console.log(`PDFTools rodando em http://localhost:${PORT}`));

@@ -1,0 +1,7 @@
+node_modules
+uploads
+tmp
+npm-debug.log
+.git
+.gitignore
+*.md
