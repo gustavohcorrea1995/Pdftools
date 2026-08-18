@@ -373,31 +373,39 @@ app.get('/api/preview/:id/:page', async (req, res) => {
   const id = req.params.id.replace(/\.pdf$/i, '');
   const page = Number(req.params.page);
 
-  if(!Number.isInteger(page) || page < 1){
+  if (!Number.isInteger(page) || page < 1) {
     return res.status(400).send('Página inválida.');
   }
 
   const pdfPath = path.join(UP, id + '.pdf');
-  const thumbPath = path.join(UP, 'thumbs_' + id, `p-${page}.png`);
+  const thumbDir = path.join(UP, 'thumbs_' + id);
+  const thumbPath = path.join(thumbDir, `p-${page}.png`);
 
   try {
-    // Primeiro tenta entregar a miniatura já renderizada pelo /api/inspect.
-    if(fs.existsSync(thumbPath)){
-      res.type('png');
-      return res.sendFile(path.resolve(thumbPath));
-    }
-
-    // Fallback: se a miniatura desapareceu (reinício do Render, limpeza
-    // temporária, etc.), renderiza a página novamente a partir do PDF salvo.
-    // Isso evita a imagem quebrada no editor.
-    if(!fs.existsSync(pdfPath)){
+    if (!fs.existsSync(pdfPath)) {
       return res.status(404).send('PDF temporário não encontrado. Envie o PDF novamente.');
     }
 
+    // Entrega a miniatura existente somente se ela realmente tiver conteúdo.
+    if (fs.existsSync(thumbPath)) {
+      const stat = await fs.promises.stat(thumbPath);
+      if (stat.size > 0) {
+        const data = await fs.promises.readFile(thumbPath);
+        res.status(200);
+        res.set({
+          'Content-Type': 'image/png',
+          'Content-Length': data.length,
+          'Cache-Control': 'no-store'
+        });
+        return res.end(data);
+      }
+    }
+
+    // Se a miniatura não existir, renderiza somente a página solicitada.
     const workDir = path.join(TMP, 'preview_' + id);
     fs.mkdirSync(workDir, { recursive: true });
 
-    const outputPrefix = path.join(workDir, 'page');
+    const outputPrefix = path.join(workDir, `page_${page}`);
 
     await run('pdftoppm', [
       '-f', String(page),
@@ -410,23 +418,28 @@ app.get('/api/preview/:id/:page', async (req, res) => {
 
     const renderedPath = outputPrefix + '.png';
 
-    if(!fs.existsSync(renderedPath)){
+    if (!fs.existsSync(renderedPath)) {
       cleanup(workDir);
       return res.status(500).send('Não foi possível renderizar a página do PDF.');
     }
 
-    res.type('png');
     const data = await fs.promises.readFile(renderedPath);
+
+    res.status(200);
     res.set({
       'Content-Type': 'image/png',
+      'Content-Length': data.length,
       'Cache-Control': 'no-store'
     });
     res.end(data);
 
     cleanup(workDir);
-  } catch(e) {
+  } catch (e) {
     console.error('Erro na pré-visualização:', e);
-    res.status(500).send('Erro ao renderizar a página: ' + e.message);
+    cleanup(path.join(TMP, 'preview_' + id));
+    if (!res.headersSent) {
+      return res.status(500).send('Erro ao renderizar a página: ' + e.message);
+    }
   }
 });
 
