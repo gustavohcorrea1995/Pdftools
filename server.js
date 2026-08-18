@@ -240,32 +240,15 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
   const inputPath = req.file.path;
   const id = uuid();
   const workDir = path.join(UP, 'thumbs_' + id);
-  fs.mkdirSync(workDir, { recursive: true });
 
   try {
+    fs.mkdirSync(workDir, { recursive: true });
+
+    // O PDF é copiado imediatamente. Não renderizamos todas as páginas aqui:
+    // isso deixa o primeiro carregamento muito mais rápido.
     const bytes = fs.readFileSync(inputPath);
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const pageCount = src.getPageCount();
-
-    // Renderiza todas as páginas para a pré-visualização.
-    await run('pdftoppm', [
-      '-png', '-r', '120',
-      inputPath,
-      path.join(workDir, 'p')
-    ]);
-
-    const files = fs.readdirSync(workDir)
-      .filter(f => /^p-\d+\.png$/i.test(f))
-      .sort((a,b) => {
-        const na = parseInt(a.match(/\d+/)[0],10);
-        const nb = parseInt(b.match(/\d+/)[0],10);
-        return na - nb;
-      });
-
-    if(files.length !== pageCount){
-      throw new Error(`A pré-visualização gerou ${files.length} página(s), mas o PDF possui ${pageCount}.`);
-    }
-
     const finalName = id + '.pdf';
     fs.copyFileSync(inputPath, path.join(UP, finalName));
 
@@ -274,11 +257,11 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       return { width, height };
     });
 
-    // Extrai cada palavra com bounding box em pontos, origem no topo.
+    // Extração de texto é feita uma única vez.
     let textBoxes = [];
     const bboxPath = path.join(workDir, 'bbox.html');
 
-    try{
+    try {
       await run('pdftotext', [
         '-bbox',
         '-enc', 'UTF-8',
@@ -295,7 +278,7 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
         )];
 
         words.forEach((w, wordIndex) => {
-          const clean = w[5].replace(/<[^>]+>/g,'').trim();
+          const clean = w[5].replace(/<[^>]+>/g, '').trim();
           if(!clean) return;
 
           const pdfX = parseFloat(w[1]);
@@ -303,14 +286,16 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
           const pdfXMax = parseFloat(w[3]);
           const pdfYMax = parseFloat(w[4]);
 
+          // A prévia agora é 90 DPI para carregar mais rápido.
+          const scale90 = 90 / 72;
+
           textBoxes.push({
             id:`p${pageIndex+1}-w${wordIndex+1}`,
             page:pageIndex+1,
-            // 120 DPI = 120/72 pixels per PDF point.
-            x:pdfX * (120/72),
-            y:pdfY * (120/72),
-            width:Math.max(1,(pdfXMax-pdfX) * (120/72)),
-            height:Math.max(1,(pdfYMax-pdfY) * (120/72)),
+            x:pdfX * scale90,
+            y:pdfY * scale90,
+            width:Math.max(1,(pdfXMax-pdfX) * scale90),
+            height:Math.max(1,(pdfYMax-pdfY) * scale90),
             pdfX,
             pdfY,
             pdfWidth:Math.max(1,pdfXMax-pdfX),
@@ -320,7 +305,7 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
           });
         });
       });
-    }catch(extractErr){
+    } catch(extractErr) {
       console.log('Falha ao extrair caixas de texto:', extractErr.message);
     }
 
@@ -328,19 +313,25 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       fileId:finalName,
       pageCount,
       pageSizes,
-      thumbnails:files.map((_,i) => `/api/preview/${id}/${i+1}`),
+      // A imagem só é criada quando o navegador realmente pede a página.
+      thumbnails:Array.from(
+        {length:pageCount},
+        (_,i) => `/api/preview/${id}/${i+1}`
+      ),
       textBoxes
     });
 
-  }catch(e){
+  } catch(e) {
     cleanup(inputPath, workDir, path.join(UP, id + '.pdf'));
     res.status(500).json({ error:e.message });
-  }finally{
+  } finally {
     cleanup(inputPath);
   }
 });
 
-app.get('/api/preview/:id/:page', (req,res)=>{
+// Renderização sob demanda: só renderiza a página que o usuário está vendo.
+// Isso elimina o atraso de renderizar um PDF inteiro antes de mostrar a primeira página.
+app.get('/api/preview/:id/:page', async (req,res)=>{
   const id = String(req.params.id).replace(/\.pdf$/i,'');
   const page = Number(req.params.page);
 
@@ -348,13 +339,40 @@ app.get('/api/preview/:id/:page', (req,res)=>{
     return res.status(400).send('Página inválida.');
   }
 
-  const filePath = path.join(UP, 'thumbs_' + id, `p-${page}.png`);
-  if(!fs.existsSync(filePath)){
-    return res.status(404).send('Pré-visualização não encontrada.');
-  }
+  const pdfPath = path.join(UP, id + '.pdf');
+  const workDir = path.join(UP, 'thumbs_' + id);
+  const pngPath = path.join(workDir, `p-${page}.png`);
 
-  res.set('Cache-Control','no-store');
-  res.type('png').sendFile(path.resolve(filePath));
+  try {
+    if(!fs.existsSync(pdfPath)){
+      return res.status(404).send('PDF não encontrado.');
+    }
+
+    fs.mkdirSync(workDir, { recursive:true });
+
+    // Se já existe, entrega imediatamente.
+    if(!fs.existsSync(pngPath)){
+      await run('pdftoppm', [
+        '-png',
+        '-r', '90',
+        '-f', String(page),
+        '-singlefile',
+        pdfPath,
+        path.join(workDir, `p-${page}`)
+      ]);
+    }
+
+    if(!fs.existsSync(pngPath)){
+      return res.status(500).send('Não foi possível renderizar esta página.');
+    }
+
+    res.set('Cache-Control','public, max-age=3600');
+    res.type('png').sendFile(path.resolve(pngPath));
+
+  } catch(e) {
+    console.error('PREVIEW:', e);
+    if(!res.headersSent) res.status(500).send(e.message);
+  }
 });
 
 
