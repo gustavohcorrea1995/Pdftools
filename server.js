@@ -57,10 +57,29 @@ function parseRanges(str, pageCount) {
   });
 }
 
-function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
-  res.download(filePath, downloadName, (err) => {
+async function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
+  try {
+    // Envia o PDF diretamente na resposta antes de apagar o temporário.
+    // Isso evita falhas de download no Render causadas pelo res.download()
+    // enquanto o arquivo temporário é removido.
+    const data = await fs.promises.readFile(filePath);
+
+    res.status(200);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${downloadName}"`,
+      'Content-Length': data.length,
+      'Cache-Control': 'no-store'
+    });
+
+    res.end(data);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  } finally {
     cleanup(filePath, ...extraFiles);
-  });
+  }
 }
 
 // ---------- MERGE ----------
