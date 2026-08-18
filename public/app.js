@@ -884,4 +884,3 @@ RENDERERS['annotate'] = (root)=>{
     setLoading(btn, false);
   };
 };
-
