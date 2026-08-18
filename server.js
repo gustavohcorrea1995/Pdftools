@@ -57,10 +57,29 @@ function parseRanges(str, pageCount) {
   });
 }
 
-function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
-  res.download(filePath, downloadName, (err) => {
+async function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
+  try {
+    // Envia o PDF diretamente na resposta antes de apagar o temporário.
+    // Isso evita falhas de download no Render causadas pelo res.download()
+    // enquanto o arquivo temporário é removido.
+    const data = await fs.promises.readFile(filePath);
+
+    res.status(200);
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${downloadName}"`,
+      'Content-Length': data.length,
+      'Cache-Control': 'no-store'
+    });
+
+    res.end(data);
+  } catch (err) {
+    if (!res.headersSent) {
+      res.status(500).json({ error: err.message });
+    }
+  } finally {
     cleanup(filePath, ...extraFiles);
-  });
+  }
 }
 
 // ---------- MERGE ----------
@@ -240,15 +259,25 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
   const inputPath = req.file.path;
   const id = uuid();
   const workDir = path.join(UP, 'thumbs_' + id);
+  fs.mkdirSync(workDir, { recursive: true });
 
   try {
-    fs.mkdirSync(workDir, { recursive: true });
-
-    // O PDF é copiado imediatamente. Não renderizamos todas as páginas aqui:
-    // isso deixa o primeiro carregamento muito mais rápido.
     const bytes = fs.readFileSync(inputPath);
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const pageCount = src.getPageCount();
+
+    // Renderiza cada página para o editor visual.
+    await run('pdftoppm', [
+      '-png',
+      '-r', '120',
+      inputPath,
+      path.join(workDir, 'p')
+    ]);
+
+    const files = fs.readdirSync(workDir)
+      .filter(f => f.toLowerCase().endsWith('.png'))
+      .sort();
+
     const finalName = id + '.pdf';
     fs.copyFileSync(inputPath, path.join(UP, finalName));
 
@@ -257,11 +286,12 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       return { width, height };
     });
 
-    // Extração de texto é feita uma única vez.
+    // Extrai as caixas de texto existentes.
     let textBoxes = [];
-    const bboxPath = path.join(workDir, 'bbox.html');
 
     try {
+      const bboxPath = path.join(workDir, 'bbox.html');
+
       await run('pdftotext', [
         '-bbox',
         '-enc', 'UTF-8',
@@ -270,252 +300,224 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       ]);
 
       const html = fs.readFileSync(bboxPath, 'utf8');
-      const pages = [...html.matchAll(/<page[^>]*>([\s\S]*?)<\/page>/gi)];
 
-      pages.forEach((pm, pageIndex) => {
-        const words = [...pm[1].matchAll(
-          /<word[^>]*xMin="([0-9.]+)"[^>]*yMin="([0-9.]+)"[^>]*xMax="([0-9.]+)"[^>]*yMax="([0-9.]+)"[^>]*>([\s\S]*?)<\/word>/gi
-        )];
+      const pages = [
+        ...html.matchAll(/<page[^>]*>([\s\S]*?)<\/page>/gi)
+      ];
+
+      pages.forEach((pageMatch, pageIndex) => {
+        const words = [
+          ...pageMatch[1].matchAll(
+            /<word[^>]*xMin="([0-9.]+)"[^>]*yMin="([0-9.]+)"[^>]*xMax="([0-9.]+)"[^>]*yMax="([0-9.]+)"[^>]*>([\s\S]*?)<\/word>/gi
+          )
+        ];
 
         words.forEach((w, wordIndex) => {
-          const clean = w[5].replace(/<[^>]+>/g, '').trim();
-          if(!clean) return;
+          const text = w[5]
+            .replace(/<[^>]+>/g, '')
+            .trim();
 
-          const pdfX = parseFloat(w[1]);
-          const pdfY = parseFloat(w[2]);
-          const pdfXMax = parseFloat(w[3]);
-          const pdfYMax = parseFloat(w[4]);
+          if(!text) return;
 
-          // A prévia agora é 90 DPI para carregar mais rápido.
-          const scale90 = 90 / 72;
+          const PT_TO_PX = 120 / 72;
+
+          const xPt = parseFloat(w[1]);
+          const yPt = parseFloat(w[2]);
+          const xMaxPt = parseFloat(w[3]);
+          const yMaxPt = parseFloat(w[4]);
+
+          // pdftotext usa pontos; a página é renderizada pelo pdftoppm
+          // a 120 DPI. Convertendo aqui, a caixa fica sobre o texto
+          // real da imagem, sem precisar "caçar" a informação.
+          const x = xPt * PT_TO_PX;
+          const y = yPt * PT_TO_PX;
+          const width = Math.max(1, (xMaxPt - xPt) * PT_TO_PX);
+          const height = Math.max(1, (yMaxPt - yPt) * PT_TO_PX);
 
           textBoxes.push({
-            id:`p${pageIndex+1}-w${wordIndex+1}`,
-            page:pageIndex+1,
-            x:pdfX * scale90,
-            y:pdfY * scale90,
-            width:Math.max(1,(pdfXMax-pdfX) * scale90),
-            height:Math.max(1,(pdfYMax-pdfY) * scale90),
-            pdfX,
-            pdfY,
-            pdfWidth:Math.max(1,pdfXMax-pdfX),
-            pdfHeight:Math.max(1,pdfYMax-pdfY),
-            text:clean,
-            fontSize:Math.max(6,pdfYMax-pdfY)
+            id: `p${pageIndex + 1}-w${wordIndex + 1}`,
+            page: pageIndex + 1,
+            x,
+            y,
+            width,
+            height,
+            text,
+            fontSize: Math.max(6, yMaxPt - yPt)
           });
         });
       });
-    } catch(extractErr) {
-      console.log('Falha ao extrair caixas de texto:', extractErr.message);
+    } catch(err) {
+      console.log('PDF sem camada de texto ou falha no OCR:', err.message);
     }
 
     res.json({
-      fileId:finalName,
+      fileId: finalName,
       pageCount,
       pageSizes,
-      // A imagem só é criada quando o navegador realmente pede a página.
-      thumbnails:Array.from(
-        {length:pageCount},
-        (_,i) => `/api/preview/${id}/${i+1}`
+      thumbnails: files.map((f, index) =>
+        `/api/preview/${finalName}/${index + 1}`
       ),
       textBoxes
     });
 
   } catch(e) {
-    cleanup(inputPath, workDir, path.join(UP, id + '.pdf'));
-    res.status(500).json({ error:e.message });
+    res.status(500).json({ error: e.message });
   } finally {
     cleanup(inputPath);
   }
 });
 
-// Renderização sob demanda: só renderiza a página que o usuário está vendo.
-// Isso elimina o atraso de renderizar um PDF inteiro antes de mostrar a primeira página.
-app.get('/api/preview/:id/:page', async (req,res)=>{
-  const id = String(req.params.id).replace(/\.pdf$/i,'');
-  const page = Number(req.params.page);
 
-  if(!Number.isInteger(page) || page < 1){
-    return res.status(400).send('Página inválida.');
-  }
-
-  const pdfPath = path.join(UP, id + '.pdf');
-  const workDir = path.join(UP, 'thumbs_' + id);
-  const pngPath = path.join(workDir, `p-${page}.png`);
-
+// ---------- PREVIEW: entrega as páginas renderizadas do editor ----------
+app.get('/api/preview/:id/:page', (req, res) => {
   try {
-    if(!fs.existsSync(pdfPath)){
-      return res.status(404).send('PDF não encontrado.');
+    const id = req.params.id.replace(/\.pdf$/i, '');
+    const page = Number(req.params.page);
+
+    if(!Number.isInteger(page) || page < 1){
+      return res.status(400).send('Página inválida.');
     }
 
-    fs.mkdirSync(workDir, { recursive:true });
+    const filePath = path.join(
+      UP,
+      'thumbs_' + id,
+      `p-${page}.png`
+    );
 
-    // Se já existe, entrega imediatamente.
-    if(!fs.existsSync(pngPath)){
-      await run('pdftoppm', [
-        '-png',
-        '-r', '90',
-        '-f', String(page),
-        '-singlefile',
-        pdfPath,
-        path.join(workDir, `p-${page}`)
-      ]);
+    if(!fs.existsSync(filePath)){
+      return res.status(404).send('Página do PDF não encontrada.');
     }
 
-    if(!fs.existsSync(pngPath)){
-      return res.status(500).send('Não foi possível renderizar esta página.');
-    }
-
-    res.set('Cache-Control','public, max-age=3600');
-    res.type('png').sendFile(path.resolve(pngPath));
-
+    res.type('png').sendFile(path.resolve(filePath));
   } catch(e) {
-    console.error('PREVIEW:', e);
-    if(!res.headersSent) res.status(500).send(e.message);
+    res.status(500).send(e.message);
   }
 });
-
 
 app.use('/uploads', express.static(UP));
 
 // ---------- EDIT: add text / image overlay ----------
-app.post('/api/edit/annotate', async (req,res)=>{
-  const { fileId } = req.body;
+app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
+  try {
+    const { fileId, annotations } = req.body;
 
-  try{
-    const annotations = JSON.parse(req.body.annotations || '[]');
-    const filePath = path.join(UP, path.basename(fileId || ''));
+    const filePath = path.join(UP, fileId);
 
-    if(!fileId || !fs.existsSync(filePath)){
+    if(!fs.existsSync(filePath)){
       return res.status(400).json({
-        error:'Arquivo não encontrado. Reenvie o PDF.'
+        error: 'Arquivo não encontrado. Reenvie o PDF.'
       });
     }
 
-    if(!annotations.length){
-      return res.status(400).json({
-        error:'Nenhuma alteração foi informada.'
-      });
-    }
+    const bytes = fs.readFileSync(filePath);
 
-    // MuPDF faz a remoção destrutiva do conteúdo original.
-    const mupdf = require('mupdf');
-    const originalBytes = fs.readFileSync(filePath);
+    const doc = await PDFDocument.load(bytes, {
+      ignoreEncryption: true
+    });
 
-    const mupdfDoc = mupdf.Document.openDocument(
-      originalBytes,
-      'application/pdf'
+    const font = await doc.embedFont(
+      StandardFonts.Helvetica
     );
 
-    // Agrupa as alterações por página.
-    const byPage = new Map();
-
-    for(const a of annotations){
-      const p = Number(a.page);
-      if(!Number.isInteger(p) || p < 1) continue;
-
-      if(!byPage.has(p)) byPage.set(p, []);
-      byPage.get(p).push(a);
-    }
-
-    for(const [pageNumber, items] of byPage.entries()){
-      const page = mupdfDoc.loadPage(pageNumber - 1);
-
-      for(const a of items){
-        const x = Number(a.x);
-        const y = Number(a.y);
-        const w = Number(a.width);
-        const h = Number(a.height);
-
-        if(!Number.isFinite(x) || !Number.isFinite(y) ||
-           !Number.isFinite(w) || !Number.isFinite(h)) continue;
-
-        // Pequena margem para garantir que todos os glifos da palavra
-        // sejam atingidos pela redação.
-        const padX = 1.5;
-        const padY = 1.5;
-
-        const rect = [
-          Math.max(0, x - padX),
-          Math.max(0, y - padY),
-          x + w + padX,
-          y + h + padY
-        ];
-
-        page.addRedaction({
-          x:rect[0],
-          y:rect[1],
-          width:rect[2]-rect[0],
-          height:rect[3]-rect[1]
-        });
-      }
-
-      // Sem caixa preta: remove o conteúdo e preserva a aparência do fundo.
-      page.applyRedactions(
-        false,
-        mupdf.PDFPage.REDACT_IMAGE_NONE,
-        mupdf.PDFPage.REDACT_LINE_ART_NONE,
-        mupdf.PDFPage.REDACT_TEXT_REMOVE
-      );
-    }
-
-    const redactedBuffer = mupdfDoc.saveToBuffer('garbage=2,compress=yes');
-    const redactedBytes = redactedBuffer.asUint8Array
-      ? redactedBuffer.asUint8Array()
-      : redactedBuffer;
-
-    // Reabre a versão já redigida para desenhar os textos substitutos.
-    const doc = await PDFDocument.load(
-      Buffer.from(redactedBytes),
-      { ignoreEncryption:true }
+    const anns = JSON.parse(
+      annotations || '[]'
     );
 
-    const font = await doc.embedFont(StandardFonts.Helvetica);
-
-    for(const a of annotations){
-      if(a.deleted) continue;
-
-      const text = String(a.text ?? '');
-      if(!text) continue;
-
-      const page = doc.getPage(Number(a.page) - 1);
+    for(const a of anns){
+      const page = doc.getPage(a.page - 1);
       if(!page) continue;
 
       const { height } = page.getSize();
-      const size = Number(a.fontSize || a.size || 10);
 
-      // MuPDF/pdftotext usam origem no topo; pdf-lib usa origem embaixo.
-      const x = Number(a.x);
-      const topY = Number(a.y);
-      const h = Number(a.height || size);
-      const y = height - topY - Math.max(h, size);
+      // Edita um texto existente encontrado pelo pdftotext.
+      if(a.id && a.id.startsWith('p') && a.text !== undefined){
+        const x = Number(a.x) || 0;
+        const y = Number(a.y) || 0;
+        const width = Number(a.width) || 20;
+        const textHeight = Number(a.height) || 12;
+        const fontSize = Number(a.fontSize) || Math.max(7, textHeight);
 
-      page.drawText(text, {
-        x,
-        y,
-        size,
-        font,
-        color:rgb(0.1,0.1,0.1)
-      });
+        // Cobre o texto antigo. Quando "deleted" for true, não desenha
+        // nada por cima: o texto fica efetivamente removido visualmente.
+        const paddingX = 2;
+        const paddingY = 2;
+
+        page.drawRectangle({
+          x: Math.max(0, x - paddingX),
+          y: Math.max(0, height - y - textHeight - paddingY),
+          width: width + paddingX * 2,
+          height: textHeight + paddingY * 2,
+          color: rgb(1, 1, 1),
+          borderWidth: 0
+        });
+
+        if(!a.deleted && String(a.text || '').length){
+          page.drawText(String(a.text), {
+            x,
+            y: height - y - fontSize,
+            size: fontSize,
+            font,
+            color: rgb(0.1, 0.1, 0.1)
+          });
+        }
+
+        continue;
+      }
+
+      // Mantém suporte para adicionar texto novo.
+      if(a.type === 'text'){
+        page.drawText(a.text || '', {
+          x: Number(a.x) || 0,
+          y: height - (Number(a.y) || 0),
+          size: Number(a.size) || 16,
+          font,
+          color: rgb(...(a.color || [0, 0, 0]))
+        });
+
+        continue;
+      }
+
+      // Mantém suporte para adicionar imagem/carimbo.
+      if(a.type === 'image' && req.file){
+        const imgBytes = fs.readFileSync(req.file.path);
+
+        const img = req.file.mimetype.includes('png')
+          ? await doc.embedPng(imgBytes)
+          : await doc.embedJpg(imgBytes);
+
+        const width = Number(a.width) || 150;
+        const imgHeight = (width / img.width) * img.height;
+
+        page.drawImage(img, {
+          x: Number(a.x) || 0,
+          y: height - (Number(a.y) || 0) - imgHeight,
+          width,
+          height: imgHeight
+        });
+      }
     }
 
     const outBytes = await doc.save();
-    const outPath = path.join(TMP, uuid() + '.pdf');
+
+    const outPath = path.join(
+      TMP,
+      uuid() + '.pdf'
+    );
+
     fs.writeFileSync(outPath, outBytes);
 
     sendFileAndCleanup(
       res,
       outPath,
-      'editado.pdf'
+      'editado.pdf',
+      req.file ? [req.file.path] : []
     );
 
-  }catch(e){
-    console.error('EDIT/ANNOTATE:', e);
-    if(!res.headersSent){
-      res.status(500).json({ error:e.message });
-    }
+  } catch(e) {
+    res.status(500).json({
+      error: e.message
+    });
   }
 });
-
 
 app.listen(PORT, () => console.log(`PDFTools rodando em http://localhost:${PORT}`));
