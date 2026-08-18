@@ -143,21 +143,48 @@ function downloadBlob(blob, filename){
     throw new Error('O servidor não retornou um arquivo válido.');
   }
 
+  const dot = filename.lastIndexOf('.');
+  const defaultName = dot > 0 ? filename.slice(0, dot) : filename;
+  const extension = dot > 0 ? filename.slice(dot) : '';
+
+  let chosen = window.prompt(
+    'Digite o nome do arquivo antes de baixar:',
+    defaultName
+  );
+
+  if(chosen === null){
+    return false;
+  }
+
+  chosen = chosen.trim();
+
+  if(!chosen){
+    chosen = defaultName;
+  }
+
+  // Remove caracteres que o Windows não aceita em nomes de arquivos.
+  chosen = chosen.replace(/[\\/:*?"<>|]/g, '_');
+
+  if(extension && !chosen.toLowerCase().endsWith(extension.toLowerCase())){
+    chosen += extension;
+  }
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
 
   a.href = url;
-  a.download = filename;
+  a.download = chosen;
   a.style.display = 'none';
 
   document.body.appendChild(a);
   a.click();
 
-  // Dá tempo para o navegador iniciar o download antes de liberar a URL.
   setTimeout(()=>{
     a.remove();
     URL.revokeObjectURL(url);
   }, 1000);
+
+  return true;
 }
 
 // ---------- RENDERERS ----------
@@ -625,11 +652,22 @@ RENDERERS['annotate'] = (root)=>{
   function renderPage(){
     if(!thumbs.length) return;
 
+    const previewUrl = thumbs[currentPage - 1];
+
     previewImg.onload = ()=>{
       requestAnimationFrame(renderTextLayer);
     };
 
-    previewImg.src = thumbs[currentPage - 1];
+    previewImg.onerror = ()=>{
+      console.error('Erro ao carregar a página do PDF:', previewUrl);
+      status.textContent =
+        'Não foi possível carregar a página do PDF. Tente recarregar a página.';
+    };
+
+    previewImg.src = new URL(
+      previewUrl,
+      window.location.origin
+    ).href;
 
     const indicator = document.getElementById('pageIndicator');
     if(indicator){
