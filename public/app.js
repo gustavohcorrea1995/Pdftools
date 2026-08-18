@@ -525,36 +525,41 @@ RENDERERS['annotate'] = (root)=>{
       .forEach(t => {
         const changed = edits.find(e => e.id === t.id);
 
-        if(changed && changed.deleted){
-          return;
-        }
+        const isDeleted = !!(changed && changed.deleted);
 
-        const value = changed ? changed.text : t.text;
+        const value = isDeleted
+          ? ''
+          : (changed ? changed.text : t.text);
+        const isChanged = !!changed;
 
         const box = document.createElement('div');
         box.textContent = value;
-        box.title = 'Clique para editar este texto';
+        box.title = isDeleted
+          ? 'Texto marcado para exclusão — clique para desfazer'
+          : (isChanged
+            ? 'Pré-visualização da alteração — clique para editar novamente'
+            : 'Clique para editar este texto');
 
         box.style.cssText = `
           position:absolute;
           left:${t.x * scale}px;
           top:${t.y * scale}px;
-          width:${Math.max(t.width * scale, 3)}px;
-          height:${Math.max(t.height * scale, 6)}px;
-          min-height:0;
+          width:${Math.max(t.width * scale + (isChanged ? 4 : 0), 6)}px;
+          height:${Math.max(t.height * scale + (isChanged ? 4 : 0), 6)}px;
           font-family:Arial,sans-serif;
           font-size:${Math.max(t.height * 0.82 * scale, 8)}px;
           line-height:1.05;
-          color:transparent;
-          background:rgba(255,235,59,.10);
-          border:1px solid rgba(193,68,45,.28);
+          color:${isDeleted ? 'transparent' : (isChanged ? '#111' : 'transparent')};
+          background:${isDeleted || isChanged ? '#fff' : 'rgba(255,235,59,.10)'};
+          border:${isDeleted ? '1px solid rgba(139,30,30,.85)' : (isChanged ? '1px solid rgba(193,68,45,.75)' : '1px solid rgba(193,68,45,.28)')};
           border-radius:2px;
           pointer-events:auto;
           cursor:text;
           overflow:hidden;
           white-space:pre-wrap;
           box-sizing:border-box;
-          padding:0;
+          padding:${isDeleted || isChanged ? '1px' : '0'};
+          z-index:${isDeleted || isChanged ? '5' : '1'};
         `;
 
         box.addEventListener('mouseenter', ()=>{
@@ -705,10 +710,10 @@ RENDERERS['annotate'] = (root)=>{
         edits.push({
           id: t.id,
           page: t.page,
-          x: t.x,
-          y: t.y,
-          width: t.width,
-          height: t.height,
+          x: t.pdfX ?? t.x,
+          y: t.pdfY ?? t.y,
+          width: t.pdfWidth ?? t.width,
+          height: t.pdfHeight ?? t.height,
           fontSize: t.fontSize || Math.max(t.height, 7),
           text: newValue,
           deleted: false
@@ -716,7 +721,7 @@ RENDERERS['annotate'] = (root)=>{
       }
 
       status.textContent =
-        'Texto alterado. Você pode editar ou excluir outro texto.';
+        'Pré-visualização atualizada. Você pode continuar editando antes de salvar o PDF.';
 
       close();
     }
@@ -731,10 +736,10 @@ RENDERERS['annotate'] = (root)=>{
         edits.push({
           id: t.id,
           page: t.page,
-          x: t.x,
-          y: t.y,
-          width: t.width,
-          height: t.height,
+          x: t.pdfX ?? t.x,
+          y: t.pdfY ?? t.y,
+          width: t.pdfWidth ?? t.width,
+          height: t.pdfHeight ?? t.height,
           fontSize: t.fontSize || Math.max(t.height, 7),
           text: '',
           deleted: true
@@ -742,7 +747,7 @@ RENDERERS['annotate'] = (root)=>{
       }
 
       status.textContent =
-        'Texto excluído. Ele será removido do PDF ao salvar.';
+        'Pré-visualização atualizada: texto excluído. A remoção será aplicada no PDF ao salvar.';
 
       close();
     }
@@ -851,6 +856,12 @@ RENDERERS['annotate'] = (root)=>{
       renderPage();
     }
   };
+
+  const liveHint = document.createElement('p');
+  liveHint.className = 'hint';
+  liveHint.textContent =
+    'As alterações aparecem imediatamente na pré-visualização. O PDF final só é gerado ao clicar em Salvar.';
+  root.appendChild(liveHint);
 
   const btn = makeButton(root, 'Salvar PDF editado');
   btn.dataset.label = btn.textContent;
