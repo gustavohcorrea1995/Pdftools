@@ -567,12 +567,14 @@ RENDERERS['annotate'] = (root)=>{
 
     previewImg.onload = ()=>{
       previewWrap.style.display = 'block';
+      info.textContent =
+        `Página ${currentPage} carregada. Clique diretamente nos textos para editar ou excluir.`;
       requestAnimationFrame(renderTextLayer);
     };
 
     previewImg.onerror = ()=>{
       info.textContent =
-        'A página não carregou. O servidor não entregou a prévia PNG desta página.';
+        'Não foi possível renderizar esta página. Tente recarregar o PDF.';
       textLayer.innerHTML = '';
     };
 
@@ -585,7 +587,7 @@ RENDERERS['annotate'] = (root)=>{
   dz.onchange = async (files)=>{
     if(files.length !== 1) return;
 
-    info.textContent = 'Carregando PDF e preparando a pré-visualização…';
+    info.textContent = 'PDF carregado. Renderizando a primeira página…';
     selectedId = null;
     edits.clear();
     textBoxes = [];
