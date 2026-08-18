@@ -116,20 +116,48 @@ function setLoading(btn, loading, text){
 
 async function postForm(url, formData){
   const res = await fetch(url, { method:'POST', body: formData });
+
   if(!res.ok){
     let msg = 'Falha ao processar o arquivo.';
-    try{ msg = (await res.json()).error || msg; }catch(_){}
+
+    try{
+      const type = res.headers.get('content-type') || '';
+
+      if(type.includes('application/json')){
+        const data = await res.json();
+        msg = data.error || msg;
+      }else{
+        const text = await res.text();
+        if(text) msg = text.slice(0, 500);
+      }
+    }catch(_){}
+
     throw new Error(msg);
   }
+
   return res;
 }
 
 function downloadBlob(blob, filename){
+  if(!blob || blob.size === 0){
+    throw new Error('O servidor não retornou um arquivo válido.');
+  }
+
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = url; a.download = filename;
-  document.body.appendChild(a); a.click(); a.remove();
-  URL.revokeObjectURL(url);
+
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+
+  document.body.appendChild(a);
+  a.click();
+
+  // Dá tempo para o navegador iniciar o download antes de liberar a URL.
+  setTimeout(()=>{
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, 1000);
 }
 
 // ---------- RENDERERS ----------
