@@ -524,6 +524,11 @@ RENDERERS['annotate'] = (root)=>{
       .filter(t => t.page === currentPage)
       .forEach(t => {
         const changed = edits.find(e => e.id === t.id);
+
+        if(changed && changed.deleted){
+          return;
+        }
+
         const value = changed ? changed.text : t.text;
 
         const box = document.createElement('div');
@@ -534,8 +539,9 @@ RENDERERS['annotate'] = (root)=>{
           position:absolute;
           left:${t.x * scale}px;
           top:${t.y * scale}px;
-          width:${Math.max(t.width * scale, 6)}px;
-          min-height:${Math.max(t.height * scale, 8)}px;
+          width:${Math.max(t.width * scale, 3)}px;
+          height:${Math.max(t.height * scale, 6)}px;
+          min-height:0;
           font-family:Arial,sans-serif;
           font-size:${Math.max(t.height * 0.82 * scale, 8)}px;
           line-height:1.05;
@@ -571,80 +577,189 @@ RENDERERS['annotate'] = (root)=>{
   }
 
   function startTextEdit(t, oldValue, box){
-    const input = document.createElement('textarea');
+    // Remove any editor that may already be open.
+    pageCanvas.querySelectorAll('.pdf-text-editor').forEach(el => el.remove());
 
-    input.value = oldValue;
+    const panel = document.createElement('div');
+    panel.className = 'pdf-text-editor';
 
-    input.style.cssText = `
+    panel.style.cssText = `
       position:absolute;
-      z-index:1000;
-      left:${box.offsetLeft}px;
-      top:${box.offsetTop}px;
-      width:${Math.max(box.offsetWidth, 90)}px;
-      min-height:${Math.max(box.offsetHeight, 28)}px;
-      padding:3px 5px;
-      resize:both;
-      border:2px solid var(--stamp,#c1442d);
+      z-index:10000;
+      left:${Math.max(0, box.offsetLeft)}px;
+      top:${Math.max(0, box.offsetTop + box.offsetHeight + 6)}px;
+      width:280px;
+      max-width:calc(100% - 10px);
+      padding:10px;
+      background:#fff;
+      color:#111;
+      border:2px solid #c1442d;
+      border-radius:6px;
+      box-shadow:0 8px 25px rgba(0,0,0,.35);
+      box-sizing:border-box;
+      line-height:normal;
+    `;
+
+    const title = document.createElement('div');
+    title.textContent = 'Editar texto';
+    title.style.cssText = `
+      font-weight:700;
+      margin-bottom:7px;
+      font-family:Arial,sans-serif;
+      font-size:13px;
+    `;
+    panel.appendChild(title);
+
+    const input = document.createElement('textarea');
+    input.value = oldValue;
+    input.style.cssText = `
+      display:block;
+      width:100%;
+      min-height:70px;
+      padding:7px;
+      resize:vertical;
+      border:1px solid #999;
       border-radius:4px;
       background:#fff;
       color:#111;
       font-family:Arial,sans-serif;
-      font-size:${Math.max(t.height * 0.82 * getScale(), 10)}px;
-      line-height:1.1;
+      font-size:14px;
+      line-height:1.2;
       box-sizing:border-box;
-      pointer-events:auto;
+    `;
+    panel.appendChild(input);
+
+    const buttons = document.createElement('div');
+    buttons.style.cssText = `
+      display:flex;
+      gap:6px;
+      margin-top:8px;
+      justify-content:flex-end;
+      flex-wrap:wrap;
     `;
 
-    pageCanvas.appendChild(input);
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = 'Salvar';
+    saveBtn.style.cssText = `
+      padding:6px 12px;
+      border:0;
+      border-radius:4px;
+      cursor:pointer;
+      background:#c1442d;
+      color:#fff;
+      font-weight:700;
+    `;
+
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = 'Excluir';
+    deleteBtn.style.cssText = `
+      padding:6px 12px;
+      border:0;
+      border-radius:4px;
+      cursor:pointer;
+      background:#8b1e1e;
+      color:#fff;
+      font-weight:700;
+    `;
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancelar';
+    cancelBtn.style.cssText = `
+      padding:6px 12px;
+      border:1px solid #aaa;
+      border-radius:4px;
+      cursor:pointer;
+      background:#eee;
+      color:#222;
+      font-weight:600;
+    `;
+
+    buttons.append(saveBtn, deleteBtn, cancelBtn);
+    panel.appendChild(buttons);
+    pageCanvas.appendChild(panel);
+
     input.focus();
     input.select();
 
-    let done = false;
-
-    function finish(save=true){
-      if(done) return;
-      done = true;
-
-      if(save){
-        const newValue = input.value;
-
-        if(newValue !== oldValue){
-          const existing = edits.find(e => e.id === t.id);
-
-          if(existing){
-            existing.text = newValue;
-          }else{
-            edits.push({
-              id: t.id,
-              page: t.page,
-              x: t.x,
-              y: t.y,
-              width: t.width,
-              height: t.height,
-              fontSize: t.fontSize || Math.max(t.height, 7),
-              text: newValue
-            });
-          }
-
-          status.textContent = 'Alteração marcada. Edite outros textos ou salve o PDF.';
-        }
-      }
-
-      input.remove();
+    function close(){
+      panel.remove();
       renderTextLayer();
     }
 
-    input.addEventListener('blur', ()=>finish(true));
+    function findEdit(){
+      return edits.find(e => e.id === t.id);
+    }
 
-    input.addEventListener('keydown', e=>{
-      if(e.key === 'Escape'){
-        e.preventDefault();
-        finish(false);
+    function saveText(){
+      const newValue = input.value;
+
+      let existing = findEdit();
+
+      if(existing){
+        existing.text = newValue;
+        existing.deleted = false;
+      }else{
+        edits.push({
+          id: t.id,
+          page: t.page,
+          x: t.x,
+          y: t.y,
+          width: t.width,
+          height: t.height,
+          fontSize: t.fontSize || Math.max(t.height, 7),
+          text: newValue,
+          deleted: false
+        });
       }
 
-      if(e.key === 'Enter' && !e.shiftKey){
+      status.textContent =
+        'Texto alterado. Você pode editar ou excluir outro texto.';
+
+      close();
+    }
+
+    function deleteText(){
+      let existing = findEdit();
+
+      if(existing){
+        existing.deleted = true;
+        existing.text = '';
+      }else{
+        edits.push({
+          id: t.id,
+          page: t.page,
+          x: t.x,
+          y: t.y,
+          width: t.width,
+          height: t.height,
+          fontSize: t.fontSize || Math.max(t.height, 7),
+          text: '',
+          deleted: true
+        });
+      }
+
+      status.textContent =
+        'Texto excluído. Ele será removido do PDF ao salvar.';
+
+      close();
+    }
+
+    saveBtn.onclick = saveText;
+    deleteBtn.onclick = deleteText;
+    cancelBtn.onclick = close;
+
+    input.addEventListener('keydown', e => {
+      if(e.key === 'Escape'){
         e.preventDefault();
-        input.blur();
+        close();
+      }
+
+      if(e.key === 'Enter' && e.ctrlKey){
+        e.preventDefault();
+        saveText();
       }
     });
   }
