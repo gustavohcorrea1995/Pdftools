@@ -396,11 +396,10 @@ app.get('/api/preview/:id/:page', (req, res) => {
 
 app.use('/uploads', express.static(UP));
 
-// ---------- EDIT: add text / image overlay ----------
+// ---------- EDIT: add text / image overlay + REDAÇÃO REAL ----------
 app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
   try {
     const { fileId, annotations } = req.body;
-
     const filePath = path.join(UP, fileId);
 
     if(!fs.existsSync(filePath)){
@@ -409,52 +408,129 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
       });
     }
 
-    const bytes = fs.readFileSync(filePath);
+    const anns = JSON.parse(annotations || '[]');
 
-    const doc = await PDFDocument.load(bytes, {
-      ignoreEncryption: true
-    });
+    // ================================================================
+    // 1) REDAÇÃO REAL COM MUPDF
+    // ================================================================
+    // O editor trabalha em pixels porque a prévia é renderizada a 120 DPI.
+    // O PDF trabalha em pontos (72 DPI), então convertemos antes de criar
+    // a área de redação.
+    let mupdf;
+    try {
+      mupdf = await import('mupdf');
+    } catch (err) {
+      throw new Error(
+        'O módulo mupdf não está instalado. Faça um novo deploy após confirmar que "mupdf": "1.28.0" está no package.json.'
+      );
+    }
 
-    const font = await doc.embedFont(
-      StandardFonts.Helvetica
+    const originalBytes = fs.readFileSync(filePath);
+    const redactionDoc = mupdf.PDFDocument.openDocument(
+      originalBytes,
+      'application/pdf'
     );
 
-    const anns = JSON.parse(
-      annotations || '[]'
-    );
+    const redactedPages = new Set();
+    const PREVIEW_DPI = 120;
+    const PT_PER_PX = 72 / PREVIEW_DPI;
 
     for(const a of anns){
-      const page = doc.getPage(a.page - 1);
+      if(!a.id || !a.id.startsWith('p')) continue;
+      if(a.text === undefined) continue;
+
+      const pageIndex = Number(a.page) - 1;
+      if(!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= redactionDoc.countPages()) continue;
+
+      const xPx = Number(a.x);
+      const yPx = Number(a.y);
+      const wPx = Number(a.width);
+      const hPx = Number(a.height);
+
+      if(!Number.isFinite(xPx) || !Number.isFinite(yPx) ||
+         !Number.isFinite(wPx) || !Number.isFinite(hPx) ||
+         wPx <= 0 || hPx <= 0) continue;
+
+      const page = redactionDoc.loadPage(pageIndex);
+      const bounds = page.getBounds();
+      const pageHeight = bounds[3] - bounds[1];
+
+      const x = xPx * PT_PER_PX;
+      const yTop = yPx * PT_PER_PX;
+      const width = wPx * PT_PER_PX;
+      const height = hPx * PT_PER_PX;
+
+      // Pequena margem de segurança para pegar todos os pixels do caractere.
+      const pad = 2;
+      const x1 = Math.max(0, x - pad);
+      const y1 = Math.max(0, pageHeight - yTop - height - pad);
+      const x2 = Math.min(bounds[2], x + width + pad);
+      const y2 = Math.min(bounds[3], pageHeight - yTop + pad);
+
+      if(x2 > x1 && y2 > y1){
+        const redact = page.createAnnotation('Redact');
+        redact.setRect([x1, y1, x2, y2]);
+        redact.update();
+        redactedPages.add(pageIndex);
+      }
+
+      page.destroy();
+    }
+
+    // IMPORTANTE: aqui o conteúdo original é removido do PDF.
+    // Não é uma camada branca por cima. O texto deixa de existir na região.
+    for(const pageIndex of redactedPages){
+      const page = redactionDoc.loadPage(pageIndex);
+      page.applyRedactions(false);
+      page.destroy();
+    }
+
+    const redactedBytes = Buffer.from(
+      redactionDoc.saveToBuffer('garbage').asUint8Array()
+    );
+    redactionDoc.destroy();
+
+    // ================================================================
+    // 2) REABRE O PDF JÁ REDIGIDO
+    //    Aqui podemos desenhar o branco e, se for edição, o novo texto.
+    // ================================================================
+    const doc = await PDFDocument.load(redactedBytes, {
+      ignoreEncryption: true
+    });
+    const font = await doc.embedFont(StandardFonts.Helvetica);
+
+    for(const a of anns){
+      const page = doc.getPage(Number(a.page) - 1);
       if(!page) continue;
 
-      const { height } = page.getSize();
+      const { height: pageHeight } = page.getSize();
 
-      // Edita um texto existente encontrado pelo pdftotext.
+      // Edição/exclusão de texto existente.
       if(a.id && a.id.startsWith('p') && a.text !== undefined){
-        const x = Number(a.x) || 0;
-        const y = Number(a.y) || 0;
-        const width = Number(a.width) || 20;
-        const textHeight = Number(a.height) || 12;
-        const fontSize = Number(a.fontSize) || Math.max(7, textHeight);
+        const x = (Number(a.x) || 0) * PT_PER_PX;
+        const y = (Number(a.y) || 0) * PT_PER_PX;
+        const width = (Number(a.width) || 20) * PT_PER_PX;
+        const textHeight = (Number(a.height) || 12) * PT_PER_PX;
+        const fontSize = (Number(a.fontSize) || Math.max(7, Number(a.height) || 12)) * PT_PER_PX;
 
-        // Cobre o texto antigo. Quando "deleted" for true, não desenha
-        // nada por cima: o texto fica efetivamente removido visualmente.
-        const paddingX = 2;
-        const paddingY = 2;
+        const pad = 2;
 
+        // Só aparência: a remoção real já aconteceu acima com MuPDF.
+        // Esta área branca é para o usuário visualizar o local apagado.
         page.drawRectangle({
-          x: Math.max(0, x - paddingX),
-          y: Math.max(0, height - y - textHeight - paddingY),
-          width: width + paddingX * 2,
-          height: textHeight + paddingY * 2,
+          x: Math.max(0, x - pad),
+          y: Math.max(0, pageHeight - y - textHeight - pad),
+          width: width + pad * 2,
+          height: textHeight + pad * 2,
           color: rgb(1, 1, 1),
           borderWidth: 0
         });
 
+        // Se for edição, escreve o novo texto. Se for exclusão, não escreve nada.
         if(!a.deleted && String(a.text || '').length){
           page.drawText(String(a.text), {
             x,
-            y: height - y - fontSize,
+            y: pageHeight - y - fontSize,
             size: fontSize,
             font,
             color: rgb(0.1, 0.1, 0.1)
@@ -464,23 +540,21 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
         continue;
       }
 
-      // Mantém suporte para adicionar texto novo.
+      // Texto novo.
       if(a.type === 'text'){
         page.drawText(a.text || '', {
           x: Number(a.x) || 0,
-          y: height - (Number(a.y) || 0),
+          y: pageHeight - (Number(a.y) || 0),
           size: Number(a.size) || 16,
           font,
           color: rgb(...(a.color || [0, 0, 0]))
         });
-
         continue;
       }
 
-      // Mantém suporte para adicionar imagem/carimbo.
+      // Imagem/carimbo.
       if(a.type === 'image' && req.file){
         const imgBytes = fs.readFileSync(req.file.path);
-
         const img = req.file.mimetype.includes('png')
           ? await doc.embedPng(imgBytes)
           : await doc.embedJpg(imgBytes);
@@ -490,7 +564,7 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
 
         page.drawImage(img, {
           x: Number(a.x) || 0,
-          y: height - (Number(a.y) || 0) - imgHeight,
+          y: pageHeight - (Number(a.y) || 0) - imgHeight,
           width,
           height: imgHeight
         });
@@ -498,12 +572,7 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
     }
 
     const outBytes = await doc.save();
-
-    const outPath = path.join(
-      TMP,
-      uuid() + '.pdf'
-    );
-
+    const outPath = path.join(TMP, uuid() + '.pdf');
     fs.writeFileSync(outPath, outBytes);
 
     sendFileAndCleanup(
@@ -512,11 +581,9 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
       'editado.pdf',
       req.file ? [req.file.path] : []
     );
-
   } catch(e) {
-    res.status(500).json({
-      error: e.message
-    });
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
 });
 
