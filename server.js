@@ -350,13 +350,22 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       console.log('PDF sem camada de texto ou falha no OCR:', err.message);
     }
 
+    // IMPORTANTE:
+    // As páginas da pré-visualização são enviadas como data URLs.
+    // Assim o navegador não depende de uma segunda requisição ao
+    // filesystem temporário do Render. Isso elimina a imagem quebrada
+    // que estava aparecendo no editor.
+    const thumbnails = files.map((f) => {
+      const pngPath = path.join(workDir, f);
+      const pngBase64 = fs.readFileSync(pngPath).toString('base64');
+      return `data:image/png;base64,${pngBase64}`;
+    });
+
     res.json({
       fileId: finalName,
       pageCount,
       pageSizes,
-      thumbnails: files.map((f, index) =>
-        `/api/preview/${finalName}/${index + 1}`
-      ),
+      thumbnails,
       textBoxes
     });
 
