@@ -319,28 +319,25 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
 
           if(!text) return;
 
-          const PT_TO_PX = 120 / 72;
-
           const xPt = parseFloat(w[1]);
           const yPt = parseFloat(w[2]);
           const xMaxPt = parseFloat(w[3]);
           const yMaxPt = parseFloat(w[4]);
-
-          // pdftotext usa pontos; a página é renderizada pelo pdftoppm
-          // a 120 DPI. Convertendo aqui, a caixa fica sobre o texto
-          // real da imagem, sem precisar "caçar" a informação.
-          const x = xPt * PT_TO_PX;
-          const y = yPt * PT_TO_PX;
-          const width = Math.max(1, (xMaxPt - xPt) * PT_TO_PX);
-          const height = Math.max(1, (yMaxPt - yPt) * PT_TO_PX);
+          const PT_TO_PX = 120 / 72;
 
           textBoxes.push({
             id: `p${pageIndex + 1}-w${wordIndex + 1}`,
             page: pageIndex + 1,
-            x,
-            y,
-            width,
-            height,
+            // Display coordinates (120 DPI PNG).
+            x: xPt * PT_TO_PX,
+            y: yPt * PT_TO_PX,
+            width: Math.max(1, (xMaxPt - xPt) * PT_TO_PX),
+            height: Math.max(1, (yMaxPt - yPt) * PT_TO_PX),
+            // Original PDF coordinates (points), used for real redaction.
+            pdfX: xPt,
+            pdfY: yPt,
+            pdfWidth: Math.max(1, xMaxPt - xPt),
+            pdfHeight: Math.max(1, yMaxPt - yPt),
             text,
             fontSize: Math.max(6, yMaxPt - yPt)
           });
@@ -400,7 +397,6 @@ app.use('/uploads', express.static(UP));
 app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
   try {
     const { fileId, annotations } = req.body;
-
     const filePath = path.join(UP, fileId);
 
     if(!fs.existsSync(filePath)){
@@ -409,49 +405,93 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
       });
     }
 
-    const bytes = fs.readFileSync(filePath);
+    const anns = JSON.parse(annotations || '[]');
+    const originalBytes = fs.readFileSync(filePath);
 
-    const doc = await PDFDocument.load(bytes, {
+    // MuPDF é usado somente para REDAÇÃO real. Diferente de um retângulo
+    // branco, applyRedactions() remove o conteúdo que está na área.
+    let mupdf;
+    try {
+      mupdf = await import('mupdf');
+    } catch (err) {
+      throw new Error(
+        'O módulo de redação PDF (mupdf) não está instalado. Adicione "mupdf": "1.28.0" ao package.json e faça um novo deploy.'
+      );
+    }
+
+    const redactionDoc = mupdf.Document.openDocument(
+      originalBytes,
+      'application/pdf'
+    );
+    const redactionPdf = redactionDoc.asPDF();
+
+    const pagesWithRedactions = new Set();
+
+    for(const a of anns){
+      if(!a.id || !a.id.startsWith('p')) continue;
+
+      const pageIndex = Number(a.page) - 1;
+      if(!Number.isInteger(pageIndex) || pageIndex < 0) continue;
+
+      const x = Number(a.x);
+      const yTop = Number(a.y);
+      const width = Number(a.width);
+      const height = Number(a.height);
+
+      if(!Number.isFinite(x) || !Number.isFinite(yTop) ||
+         !Number.isFinite(width) || !Number.isFinite(height) ||
+         width <= 0 || height <= 0) continue;
+
+      const page = redactionPdf.loadPage(pageIndex);
+      const pageHeight = page.getBounds()[3] - page.getBounds()[1];
+
+      // pdftotext usa origem no topo; MuPDF/PDF usa origem embaixo.
+      const y1 = pageHeight - yTop - height;
+      const y2 = pageHeight - yTop;
+
+      const redact = page.createAnnotation('Redact');
+      redact.setRect([x, y1, x + width, y2]);
+      redact.update();
+
+      pagesWithRedactions.add(pageIndex);
+      page.destroy();
+    }
+
+    // Aplicação permanente: o texto original deixa de existir na região.
+    for(const pageIndex of pagesWithRedactions){
+      const page = redactionPdf.loadPage(pageIndex);
+      page.applyRedactions();
+      page.destroy();
+    }
+
+    const redactedBytes = Buffer.from(
+      redactionPdf.saveToBuffer('garbage').asUint8Array()
+    );
+
+    redactionDoc.destroy();
+
+    // Depois da redação, usamos pdf-lib apenas para desenhar texto novo
+    // e/ou imagens. O texto antigo já foi removido antes desta etapa.
+    const doc = await PDFDocument.load(redactedBytes, {
       ignoreEncryption: true
     });
 
-    const font = await doc.embedFont(
-      StandardFonts.Helvetica
-    );
-
-    const anns = JSON.parse(
-      annotations || '[]'
-    );
+    const font = await doc.embedFont(StandardFonts.Helvetica);
 
     for(const a of anns){
-      const page = doc.getPage(a.page - 1);
+      const page = doc.getPage(Number(a.page) - 1);
       if(!page) continue;
 
       const { height } = page.getSize();
 
-      // Edita um texto existente encontrado pelo pdftotext.
+      // Edição de texto: a área já foi redigida acima. Agora só adiciona
+      // o novo texto se o usuário não tiver escolhido Excluir.
       if(a.id && a.id.startsWith('p') && a.text !== undefined){
-        const x = Number(a.x) || 0;
-        const y = Number(a.y) || 0;
-        const width = Number(a.width) || 20;
-        const textHeight = Number(a.height) || 12;
-        const fontSize = Number(a.fontSize) || Math.max(7, textHeight);
+        if(!a.deleted && String(a.text).trim().length){
+          const x = Number(a.x) || 0;
+          const y = Number(a.y) || 0;
+          const fontSize = Number(a.fontSize) || 10;
 
-        // Cobre o texto antigo. Quando "deleted" for true, não desenha
-        // nada por cima: o texto fica efetivamente removido visualmente.
-        const paddingX = 2;
-        const paddingY = 2;
-
-        page.drawRectangle({
-          x: Math.max(0, x - paddingX),
-          y: Math.max(0, height - y - textHeight - paddingY),
-          width: width + paddingX * 2,
-          height: textHeight + paddingY * 2,
-          color: rgb(1, 1, 1),
-          borderWidth: 0
-        });
-
-        if(!a.deleted && String(a.text || '').length){
           page.drawText(String(a.text), {
             x,
             y: height - y - fontSize,
@@ -460,11 +500,10 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
             color: rgb(0.1, 0.1, 0.1)
           });
         }
-
         continue;
       }
 
-      // Mantém suporte para adicionar texto novo.
+      // Texto novo, que não é edição de um texto existente.
       if(a.type === 'text'){
         page.drawText(a.text || '', {
           x: Number(a.x) || 0,
@@ -473,14 +512,12 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
           font,
           color: rgb(...(a.color || [0, 0, 0]))
         });
-
         continue;
       }
 
-      // Mantém suporte para adicionar imagem/carimbo.
+      // Imagem/carimbo.
       if(a.type === 'image' && req.file){
         const imgBytes = fs.readFileSync(req.file.path);
-
         const img = req.file.mimetype.includes('png')
           ? await doc.embedPng(imgBytes)
           : await doc.embedJpg(imgBytes);
@@ -498,12 +535,7 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
     }
 
     const outBytes = await doc.save();
-
-    const outPath = path.join(
-      TMP,
-      uuid() + '.pdf'
-    );
-
+    const outPath = path.join(TMP, uuid() + '.pdf');
     fs.writeFileSync(outPath, outBytes);
 
     sendFileAndCleanup(
@@ -512,11 +544,9 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
       'editado.pdf',
       req.file ? [req.file.path] : []
     );
-
   } catch(e) {
-    res.status(500).json({
-      error: e.message
-    });
+    console.error(e);
+    res.status(500).json({ error: e.message });
   }
 });
 
