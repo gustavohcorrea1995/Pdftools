@@ -319,20 +319,33 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
 
           if(!text) return;
 
-          const x = parseFloat(w[1]);
-          const y = parseFloat(w[2]);
-          const xMax = parseFloat(w[3]);
-          const yMax = parseFloat(w[4]);
+          const pdfX = parseFloat(w[1]);
+          const pdfY = parseFloat(w[2]);
+          const pdfXMax = parseFloat(w[3]);
+          const pdfYMax = parseFloat(w[4]);
+
+          // A página é renderizada pelo pdftoppm a 120 DPI.
+          // A tela trabalha em pixels; a redação do PDF trabalha em pontos.
+          const PT_TO_PX = 120 / 72;
 
           textBoxes.push({
             id: `p${pageIndex + 1}-w${wordIndex + 1}`,
             page: pageIndex + 1,
-            x,
-            y,
-            width: Math.max(1, xMax - x),
-            height: Math.max(1, yMax - y),
+
+            // Coordenadas em pixels para a caixa ficar exatamente sobre o texto.
+            x: pdfX * PT_TO_PX,
+            y: pdfY * PT_TO_PX,
+            width: Math.max(1, (pdfXMax - pdfX) * PT_TO_PX),
+            height: Math.max(1, (pdfYMax - pdfY) * PT_TO_PX),
+
+            // Coordenadas originais do PDF para editar/excluir de verdade.
+            pdfX,
+            pdfY,
+            pdfWidth: Math.max(1, pdfXMax - pdfX),
+            pdfHeight: Math.max(1, pdfYMax - pdfY),
+
             text,
-            fontSize: Math.max(6, yMax - y)
+            fontSize: Math.max(6, pdfYMax - pdfY)
           });
         });
       });
@@ -359,32 +372,73 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
 
 
 // ---------- PREVIEW: entrega as páginas renderizadas do editor ----------
-app.get('/api/preview/:id/:page', (req, res) => {
-  try {
-    const id = req.params.id.replace(/\.pdf$/i, '');
-    const page = Number(req.params.page);
+app.get('/api/preview/:id/:page', async (req, res) => {
+  const id = req.params.id.replace(/\.pdf$/i, '');
+  const page = Number(req.params.page);
 
-    if(!Number.isInteger(page) || page < 1){
-      return res.status(400).send('Página inválida.');
+  if(!Number.isInteger(page) || page < 1){
+    return res.status(400).send('Página inválida.');
+  }
+
+  const pdfPath = path.join(UP, id + '.pdf');
+  if(!fs.existsSync(pdfPath)){
+    return res.status(404).send('PDF não encontrado. Envie o PDF novamente.');
+  }
+
+  const thumbsDir = path.join(UP, 'thumbs_' + id);
+  const cachedPath = path.join(thumbsDir, `p-${page}.png`);
+
+  try{
+    // Primeiro usa a imagem já criada no /inspect.
+    if(fs.existsSync(cachedPath)){
+      const data = await fs.promises.readFile(cachedPath);
+      res.set({
+        'Content-Type':'image/png',
+        'Cache-Control':'no-store'
+      });
+      return res.end(data);
     }
 
-    const filePath = path.join(
-      UP,
-      'thumbs_' + id,
-      `p-${page}.png`
-    );
+    // Se a imagem não existir (por exemplo, o Render limpou o diretório
+    // temporário), renderiza a página novamente a partir do PDF original.
+    const tmpPrefix = path.join(TMP, uuid() + '-page');
 
-    if(!fs.existsSync(filePath)){
-      return res.status(404).send('Página do PDF não encontrada.');
+    try{
+      await run('pdftoppm', [
+        '-f', String(page),
+        '-singlefile',
+        '-png',
+        '-r', '120',
+        pdfPath,
+        tmpPrefix
+      ]);
+
+      const pngPath = tmpPrefix + '.png';
+
+      if(!fs.existsSync(pngPath)){
+        return res.status(500).send('Não foi possível renderizar a página do PDF.');
+      }
+
+      const data = await fs.promises.readFile(pngPath);
+
+      res.set({
+        'Content-Type':'image/png',
+        'Content-Length':data.length,
+        'Cache-Control':'no-store'
+      });
+
+      res.end(data);
+    } finally {
+      cleanup(tmpPrefix + '.png');
     }
-
-    res.type('png').sendFile(path.resolve(filePath));
-  } catch(e) {
-    res.status(500).send(e.message);
+  }catch(e){
+    console.error('Erro ao renderizar preview:', e);
+    if(!res.headersSent){
+      res.status(500).send('Erro ao renderizar a página: ' + e.message);
+    }
   }
 });
 
-app.use('/uploads', express.static(UP));
 
 // ---------- EDITOR VISUAL: redação real + edição + pré-visualização ----------
 async function loadMuPDF(){
@@ -458,8 +512,36 @@ app.post('/api/edit/preview', async (req, res) => {
     if(!fs.existsSync(filePath)) return res.status(400).json({error:'Arquivo não encontrado. Reenvie o PDF.'});
 
     const original = fs.readFileSync(filePath);
-    const redacted = await applyRedactionsToPdf(original, JSON.parse(operations || '[]'));
-    const png = await renderPdfPage(redacted, Number(page) || 1);
+    const ops = JSON.parse(operations || '[]');
+
+    // Remove o conteúdo original primeiro (redaction real).
+    let previewBytes = await applyRedactionsToPdf(original, ops);
+
+    // Para a prévia, redesenha somente os textos substituídos.
+    const previewDoc = await PDFDocument.load(previewBytes, {ignoreEncryption:true});
+    const previewFont = await previewDoc.embedFont(StandardFonts.Helvetica);
+
+    for(const op of ops){
+      if(op.type !== 'replace') continue;
+      const p = previewDoc.getPage(Number(op.page) - 1);
+      if(!p) continue;
+      const {height} = p.getSize();
+      const x = Number(op.x) || 0;
+      const y = Number(op.y) || 0;
+      const size = Number(op.fontSize) || Math.max(7, Number(op.height) || 12);
+      const text = String(op.text ?? '');
+      if(!text) continue;
+      p.drawText(text, {
+        x,
+        y: height - y - size,
+        size,
+        font: previewFont,
+        color: rgb(0.1,0.1,0.1)
+      });
+    }
+
+    previewBytes = await previewDoc.save();
+    const png = await renderPdfPage(previewBytes, Number(page) || 1);
     res.set({'Content-Type':'image/png','Cache-Control':'no-store'});
     res.end(png);
   }catch(e){
@@ -471,11 +553,34 @@ app.post('/api/edit/preview', async (req, res) => {
 // Salva as alterações no PDF. A exclusão usa REDACT e remove o conteúdo de verdade.
 app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
   try{
-    const { fileId, operations } = req.body;
+    const { fileId } = req.body;
     const filePath = path.join(UP, fileId);
     if(!fs.existsSync(filePath)) return res.status(400).json({error:'Arquivo não encontrado. Reenvie o PDF.'});
 
-    const ops = JSON.parse(operations || '[]');
+    let rawOps = req.body.operations || req.body.annotations || '[]';
+    let parsedOps = typeof rawOps === 'string' ? JSON.parse(rawOps) : rawOps;
+
+    // Aceita o formato usado pelo editor visual: deleted=true para excluir
+    // e text alterado para substituir. Mantém compatibilidade com operações
+    // já tipadas (redact/replace/text/image).
+    const ops = (parsedOps || []).map(a => {
+      if(a.type) return a;
+
+      const base = {
+        page: Number(a.page),
+        x: Number(a.pdfX ?? a.x),
+        y: Number(a.pdfY ?? a.y),
+        width: Number(a.pdfWidth ?? a.width),
+        height: Number(a.pdfHeight ?? a.height),
+        fontSize: Number(a.fontSize) || Math.max(7, Number(a.height) || 12)
+      };
+
+      if(a.deleted){
+        return {...base, type:'redact', text:''};
+      }
+
+      return {...base, type:'replace', text:String(a.text ?? '')};
+    });
     const original = fs.readFileSync(filePath);
 
     // Primeiro remove permanentemente o conteúdo selecionado.
