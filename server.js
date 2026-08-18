@@ -57,29 +57,10 @@ function parseRanges(str, pageCount) {
   });
 }
 
-async function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
-  try {
-    // Envia o PDF diretamente na resposta antes de apagar o temporário.
-    // Isso evita falhas de download no Render causadas pelo res.download()
-    // enquanto o arquivo temporário é removido.
-    const data = await fs.promises.readFile(filePath);
-
-    res.status(200);
-    res.set({
-      'Content-Type': 'application/pdf',
-      'Content-Disposition': `attachment; filename="${downloadName}"`,
-      'Content-Length': data.length,
-      'Cache-Control': 'no-store'
-    });
-
-    res.end(data);
-  } catch (err) {
-    if (!res.headersSent) {
-      res.status(500).json({ error: err.message });
-    }
-  } finally {
+function sendFileAndCleanup(res, filePath, downloadName, extraFiles = []) {
+  res.download(filePath, downloadName, (err) => {
     cleanup(filePath, ...extraFiles);
-  }
+  });
 }
 
 // ---------- MERGE ----------
@@ -259,25 +240,15 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
   const inputPath = req.file.path;
   const id = uuid();
   const workDir = path.join(UP, 'thumbs_' + id);
-  fs.mkdirSync(workDir, { recursive: true });
 
   try {
+    fs.mkdirSync(workDir, { recursive: true });
+
+    // O PDF é copiado imediatamente. Não renderizamos todas as páginas aqui:
+    // isso deixa o primeiro carregamento muito mais rápido.
     const bytes = fs.readFileSync(inputPath);
     const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
     const pageCount = src.getPageCount();
-
-    // Renderiza cada página para o editor visual.
-    await run('pdftoppm', [
-      '-png',
-      '-r', '120',
-      inputPath,
-      path.join(workDir, 'p')
-    ]);
-
-    const files = fs.readdirSync(workDir)
-      .filter(f => f.toLowerCase().endsWith('.png'))
-      .sort();
-
     const finalName = id + '.pdf';
     fs.copyFileSync(inputPath, path.join(UP, finalName));
 
@@ -286,12 +257,11 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       return { width, height };
     });
 
-    // Extrai as caixas de texto existentes.
+    // Extração de texto é feita uma única vez.
     let textBoxes = [];
+    const bboxPath = path.join(workDir, 'bbox.html');
 
     try {
-      const bboxPath = path.join(workDir, 'bbox.html');
-
       await run('pdftotext', [
         '-bbox',
         '-enc', 'UTF-8',
@@ -300,128 +270,133 @@ app.post('/api/inspect', upload.single('file'), async (req, res) => {
       ]);
 
       const html = fs.readFileSync(bboxPath, 'utf8');
+      const pages = [...html.matchAll(/<page[^>]*>([\s\S]*?)<\/page>/gi)];
 
-      const pages = [
-        ...html.matchAll(/<page[^>]*>([\s\S]*?)<\/page>/gi)
-      ];
-
-      pages.forEach((pageMatch, pageIndex) => {
-        const words = [
-          ...pageMatch[1].matchAll(
-            /<word[^>]*xMin="([0-9.]+)"[^>]*yMin="([0-9.]+)"[^>]*xMax="([0-9.]+)"[^>]*yMax="([0-9.]+)"[^>]*>([\s\S]*?)<\/word>/gi
-          )
-        ];
+      pages.forEach((pm, pageIndex) => {
+        const words = [...pm[1].matchAll(
+          /<word[^>]*xMin="([0-9.]+)"[^>]*yMin="([0-9.]+)"[^>]*xMax="([0-9.]+)"[^>]*yMax="([0-9.]+)"[^>]*>([\s\S]*?)<\/word>/gi
+        )];
 
         words.forEach((w, wordIndex) => {
-          const text = w[5]
-            .replace(/<[^>]+>/g, '')
-            .trim();
+          const clean = w[5].replace(/<[^>]+>/g, '').trim();
+          if(!clean) return;
 
-          if(!text) return;
+          const pdfX = parseFloat(w[1]);
+          const pdfY = parseFloat(w[2]);
+          const pdfXMax = parseFloat(w[3]);
+          const pdfYMax = parseFloat(w[4]);
 
-          const PT_TO_PX = 120 / 72;
-
-          const xPt = parseFloat(w[1]);
-          const yPt = parseFloat(w[2]);
-          const xMaxPt = parseFloat(w[3]);
-          const yMaxPt = parseFloat(w[4]);
-
-          // pdftotext usa pontos; a página é renderizada pelo pdftoppm
-          // a 120 DPI. Convertendo aqui, a caixa fica sobre o texto
-          // real da imagem, sem precisar "caçar" a informação.
-          const x = xPt * PT_TO_PX;
-          const y = yPt * PT_TO_PX;
-          const width = Math.max(1, (xMaxPt - xPt) * PT_TO_PX);
-          const height = Math.max(1, (yMaxPt - yPt) * PT_TO_PX);
+          // A prévia agora é 90 DPI para carregar mais rápido.
+          const scale90 = 90 / 72;
 
           textBoxes.push({
-            id: `p${pageIndex + 1}-w${wordIndex + 1}`,
-            page: pageIndex + 1,
-            x,
-            y,
-            width,
-            height,
-            text,
-            fontSize: Math.max(6, yMaxPt - yPt)
+            id:`p${pageIndex+1}-w${wordIndex+1}`,
+            page:pageIndex+1,
+            x:pdfX * scale90,
+            y:pdfY * scale90,
+            width:Math.max(1,(pdfXMax-pdfX) * scale90),
+            height:Math.max(1,(pdfYMax-pdfY) * scale90),
+            pdfX,
+            pdfY,
+            pdfWidth:Math.max(1,pdfXMax-pdfX),
+            pdfHeight:Math.max(1,pdfYMax-pdfY),
+            text:clean,
+            originalText:clean,
+            fontSize:Math.max(6,pdfYMax-pdfY)
           });
         });
       });
-    } catch(err) {
-      console.log('PDF sem camada de texto ou falha no OCR:', err.message);
+    } catch(extractErr) {
+      console.log('Falha ao extrair caixas de texto:', extractErr.message);
     }
 
     res.json({
-      fileId: finalName,
+      fileId:finalName,
       pageCount,
       pageSizes,
-      thumbnails: files.map((f, index) =>
-        `/api/preview/${finalName}/${index + 1}`
+      // A imagem só é criada quando o navegador realmente pede a página.
+      thumbnails:Array.from(
+        {length:pageCount},
+        (_,i) => `/api/preview/${id}/${i+1}`
       ),
       textBoxes
     });
 
   } catch(e) {
-    res.status(500).json({ error: e.message });
+    cleanup(inputPath, workDir, path.join(UP, id + '.pdf'));
+    res.status(500).json({ error:e.message });
   } finally {
     cleanup(inputPath);
   }
 });
 
+// Renderização sob demanda: só renderiza a página que o usuário está vendo.
+// Isso elimina o atraso de renderizar um PDF inteiro antes de mostrar a primeira página.
+app.get('/api/preview/:id/:page', async (req,res)=>{
+  const id = String(req.params.id).replace(/\.pdf$/i,'');
+  const page = Number(req.params.page);
 
-// ---------- PREVIEW: entrega as páginas renderizadas do editor ----------
-app.get('/api/preview/:id/:page', (req, res) => {
+  if(!Number.isInteger(page) || page < 1){
+    return res.status(400).send('Página inválida.');
+  }
+
+  const pdfPath = path.join(UP, id + '.pdf');
+  const workDir = path.join(UP, 'thumbs_' + id);
+  const pngPath = path.join(workDir, `p-${page}.png`);
+
   try {
-    const id = req.params.id.replace(/\.pdf$/i, '');
-    const page = Number(req.params.page);
-
-    if(!Number.isInteger(page) || page < 1){
-      return res.status(400).send('Página inválida.');
+    if(!fs.existsSync(pdfPath)){
+      return res.status(404).send('PDF não encontrado.');
     }
 
-    const filePath = path.join(
-      UP,
-      'thumbs_' + id,
-      `p-${page}.png`
-    );
+    fs.mkdirSync(workDir, { recursive:true });
 
-    if(!fs.existsSync(filePath)){
-      return res.status(404).send('Página do PDF não encontrada.');
+    // Se já existe, entrega imediatamente.
+    if(!fs.existsSync(pngPath)){
+      await run('pdftoppm', [
+        '-png',
+        '-r', '90',
+        '-f', String(page),
+        '-singlefile',
+        pdfPath,
+        path.join(workDir, `p-${page}`)
+      ]);
     }
 
-    res.type('png').sendFile(path.resolve(filePath));
+    if(!fs.existsSync(pngPath)){
+      return res.status(500).send('Não foi possível renderizar esta página.');
+    }
+
+    res.set('Cache-Control','public, max-age=3600');
+    res.type('png').sendFile(path.resolve(pngPath));
+
   } catch(e) {
-    res.status(500).send(e.message);
+    console.error('PREVIEW:', e);
+    if(!res.headersSent) res.status(500).send(e.message);
   }
 });
 
+
 app.use('/uploads', express.static(UP));
 
-// ---------- EDIT: add text / image overlay + REDAÇÃO REAL ----------
+// ---------- EDIT: add text / image overlay ----------
 app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
   try {
     const { fileId, annotations } = req.body;
-    const filePath = path.join(UP, fileId);
+    const filePath = path.join(UP, path.basename(fileId || ''));
 
-    if(!fs.existsSync(filePath)){
-      return res.status(400).json({
-        error: 'Arquivo não encontrado. Reenvie o PDF.'
-      });
+    if(!fileId || !fs.existsSync(filePath)){
+      return res.status(400).json({ error:'Arquivo não encontrado. Reenvie o PDF.' });
     }
 
     const anns = JSON.parse(annotations || '[]');
 
-    // ================================================================
-    // 1) REDAÇÃO REAL COM MUPDF
-    // ================================================================
-    // O editor trabalha em pixels porque a prévia é renderizada a 120 DPI.
-    // O PDF trabalha em pontos (72 DPI), então convertemos antes de criar
-    // a área de redação.
     let mupdf;
     try {
       mupdf = await import('mupdf');
     } catch (err) {
       throw new Error(
-        'O módulo mupdf não está instalado. Faça um novo deploy após confirmar que "mupdf": "1.28.0" está no package.json.'
+        'O módulo mupdf não está instalado. Confirme "mupdf": "1.28.0" no package.json e faça novo deploy.'
       );
     }
 
@@ -431,72 +406,154 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
       'application/pdf'
     );
 
-    const redactedPages = new Set();
-    const PREVIEW_DPI = 120;
-    const PT_PER_PX = 72 / PREVIEW_DPI;
+    // O editor já envia x/y/width/height em PONTOS do PDF (não pixels).
+    // Isso é importante: a prévia é 90 DPI, mas a anotação usa as
+    // coordenadas PDF originais.
+    const redactionPages = new Map();
 
     for(const a of anns){
       if(!a.id || !a.id.startsWith('p')) continue;
       if(a.text === undefined) continue;
 
       const pageIndex = Number(a.page) - 1;
-      if(!Number.isInteger(pageIndex) || pageIndex < 0 || pageIndex >= redactionDoc.countPages()) continue;
-
-      const xPx = Number(a.x);
-      const yPx = Number(a.y);
-      const wPx = Number(a.width);
-      const hPx = Number(a.height);
-
-      if(!Number.isFinite(xPx) || !Number.isFinite(yPx) ||
-         !Number.isFinite(wPx) || !Number.isFinite(hPx) ||
-         wPx <= 0 || hPx <= 0) continue;
+      if(!Number.isInteger(pageIndex) ||
+         pageIndex < 0 ||
+         pageIndex >= redactionDoc.countPages()) continue;
 
       const page = redactionDoc.loadPage(pageIndex);
       const bounds = page.getBounds();
-      const pageHeight = bounds[3] - bounds[1];
 
-      const x = xPx * PT_PER_PX;
-      const yTop = yPx * PT_PER_PX;
-      const width = wPx * PT_PER_PX;
-      const height = hPx * PT_PER_PX;
+      let rect = null;
 
-      // Pequena margem de segurança para pegar todos os pixels do caractere.
-      const pad = 2;
-      const x1 = Math.max(0, x - pad);
-      const y1 = Math.max(0, pageHeight - yTop - height - pad);
-      const x2 = Math.min(bounds[2], x + width + pad);
-      const y2 = Math.min(bounds[3], pageHeight - yTop + pad);
+      // 1) MÉTODO PRINCIPAL: procura o texto ORIGINAL no próprio PDF.
+      // Isso é muito mais seguro que depender apenas da posição da imagem.
+      const originalText = String(a.originalText ?? '').trim();
 
-      if(x2 > x1 && y2 > y1){
+      if(originalText){
+        try {
+          const hits = page.search(originalText);
+
+          if(hits && hits.length){
+            const expectedX = Number(a.x) || 0;
+            const expectedY = Number(a.y) || 0;
+
+            // Escolhe a ocorrência mais próxima da caixa clicada.
+            let best = null;
+            let bestDist = Infinity;
+
+            for(const q of hits){
+              const pts = Array.isArray(q) ? q : [];
+              if(pts.length < 8) continue;
+
+              const xs = [pts[0],pts[2],pts[4],pts[6]];
+              const ys = [pts[1],pts[3],pts[5],pts[7]];
+
+              const x1 = Math.min(...xs);
+              const y1 = Math.min(...ys);
+              const x2 = Math.max(...xs);
+              const y2 = Math.max(...ys);
+
+              const cx = (x1+x2)/2;
+              const cy = (y1+y2)/2;
+              const ecx = expectedX + (Number(a.width)||0)/2;
+              const ecy = expectedY + (Number(a.height)||0)/2;
+              const dist = Math.hypot(cx-ecx, cy-ecy);
+
+              if(dist < bestDist){
+                bestDist = dist;
+                best = [x1,y1,x2,y2];
+              }
+            }
+
+            if(best) rect = best;
+          }
+        } catch(searchErr) {
+          console.log('Busca para redação falhou:', searchErr.message);
+        }
+      }
+
+      // 2) FALLBACK: usa a caixa original do texto em pontos PDF.
+      // Também funciona para PDFs que não permitem busca normal.
+      if(!rect){
+        const x = Number(a.x);
+        const y = Number(a.y);
+        const w = Number(a.width);
+        const h = Number(a.height);
+
+        if(Number.isFinite(x) && Number.isFinite(y) &&
+           Number.isFinite(w) && Number.isFinite(h) &&
+           w > 0 && h > 0){
+          rect = [
+            x,
+            y,
+            x + w,
+            y + h
+          ];
+        }
+      }
+
+      if(rect){
+        const pad = 1.5;
+        const x1 = Math.max(bounds[0], rect[0] - pad);
+        const y1 = Math.max(bounds[1], rect[1] - pad);
+        const x2 = Math.min(bounds[2], rect[2] + pad);
+        const y2 = Math.min(bounds[3], rect[3] + pad);
+
+        if(x2 > x1 && y2 > y1){
+          if(!redactionPages.has(pageIndex)){
+            redactionPages.set(pageIndex, []);
+          }
+
+          redactionPages.get(pageIndex).push({
+            rect:[x1,y1,x2,y2],
+            page
+          });
+        }
+      }
+
+      // Não destrói a page aqui porque os objetos ficam necessários
+      // enquanto as redações são criadas.
+    }
+
+    // APLICA REDAÇÃO REAL.
+    // REDACT_TEXT_REMOVE remove o texto e REDACT_IMAGE_PIXELS permite
+    // que a mesma área seja tratada quando o conteúdo é uma imagem/scanned PDF.
+    for(const [pageIndex, items] of redactionPages.entries()){
+      const page = redactionDoc.loadPage(pageIndex);
+
+      for(const item of items){
+        const [x1,y1,x2,y2] = item.rect;
+
         const redact = page.createAnnotation('Redact');
-        redact.setRect([x1, y1, x2, y2]);
+        redact.setRect([x1,y1,x2,y2]);
         redact.update();
-        redactedPages.add(pageIndex);
+
+        // Sem caixa preta: a interface desenha o branco depois.
+        // A remoção acontece aqui, de forma irreversível.
+        redact.applyRedaction(
+          false,
+          mupdf.PDFPage.REDACT_IMAGE_PIXELS
+        );
       }
 
       page.destroy();
     }
 
-    // IMPORTANTE: aqui o conteúdo original é removido do PDF.
-    // Não é uma camada branca por cima. O texto deixa de existir na região.
-    for(const pageIndex of redactedPages){
-      const page = redactionDoc.loadPage(pageIndex);
-      page.applyRedactions(false);
-      page.destroy();
-    }
-
+    // Garbage collection para eliminar objetos não referenciados
+    // que poderiam manter conteúdo antigo no arquivo.
     const redactedBytes = Buffer.from(
-      redactionDoc.saveToBuffer('garbage').asUint8Array()
+      redactionDoc.saveToBuffer('garbage=4,compress=yes').asUint8Array()
     );
+
     redactionDoc.destroy();
 
-    // ================================================================
-    // 2) REABRE O PDF JÁ REDIGIDO
-    //    Aqui podemos desenhar o branco e, se for edição, o novo texto.
-    // ================================================================
+    // Reabre o PDF já redigido para desenhar o resultado visual:
+    // - branco sobre a área removida
+    // - novo texto, quando for edição
     const doc = await PDFDocument.load(redactedBytes, {
       ignoreEncryption: true
     });
+
     const font = await doc.embedFont(StandardFonts.Helvetica);
 
     for(const a of anns){
@@ -505,86 +562,61 @@ app.post('/api/edit/annotate', upload.single('image'), async (req, res) => {
 
       const { height: pageHeight } = page.getSize();
 
-      // Edição/exclusão de texto existente.
       if(a.id && a.id.startsWith('p') && a.text !== undefined){
-        const x = (Number(a.x) || 0) * PT_PER_PX;
-        const y = (Number(a.y) || 0) * PT_PER_PX;
-        const width = (Number(a.width) || 20) * PT_PER_PX;
-        const textHeight = (Number(a.height) || 12) * PT_PER_PX;
-        const fontSize = (Number(a.fontSize) || Math.max(7, Number(a.height) || 12)) * PT_PER_PX;
+        const x = Number(a.x) || 0;
+        const yTop = Number(a.y) || 0;
+        const width = Number(a.width) || 20;
+        const textHeight = Number(a.height) || 12;
+        const fontSize = Number(a.fontSize) || Math.max(7, textHeight);
 
-        const pad = 2;
+        const pad = 1.5;
 
-        // Só aparência: a remoção real já aconteceu acima com MuPDF.
-        // Esta área branca é para o usuário visualizar o local apagado.
         page.drawRectangle({
-          x: Math.max(0, x - pad),
-          y: Math.max(0, pageHeight - y - textHeight - pad),
-          width: width + pad * 2,
-          height: textHeight + pad * 2,
-          color: rgb(1, 1, 1),
+          x: Math.max(0, x-pad),
+          y: Math.max(0, pageHeight-yTop-textHeight-pad),
+          width: width + pad*2,
+          height: textHeight + pad*2,
+          color: rgb(1,1,1),
           borderWidth: 0
         });
 
-        // Se for edição, escreve o novo texto. Se for exclusão, não escreve nada.
         if(!a.deleted && String(a.text || '').length){
           page.drawText(String(a.text), {
             x,
-            y: pageHeight - y - fontSize,
-            size: fontSize,
+            y: pageHeight-yTop-fontSize,
+            size:fontSize,
             font,
-            color: rgb(0.1, 0.1, 0.1)
+            color:rgb(0.1,0.1,0.1)
           });
         }
 
         continue;
       }
 
-      // Texto novo.
       if(a.type === 'text'){
         page.drawText(a.text || '', {
-          x: Number(a.x) || 0,
-          y: pageHeight - (Number(a.y) || 0),
-          size: Number(a.size) || 16,
+          x:Number(a.x)||0,
+          y:pageHeight-(Number(a.y)||0),
+          size:Number(a.size)||16,
           font,
-          color: rgb(...(a.color || [0, 0, 0]))
-        });
-        continue;
-      }
-
-      // Imagem/carimbo.
-      if(a.type === 'image' && req.file){
-        const imgBytes = fs.readFileSync(req.file.path);
-        const img = req.file.mimetype.includes('png')
-          ? await doc.embedPng(imgBytes)
-          : await doc.embedJpg(imgBytes);
-
-        const width = Number(a.width) || 150;
-        const imgHeight = (width / img.width) * img.height;
-
-        page.drawImage(img, {
-          x: Number(a.x) || 0,
-          y: pageHeight - (Number(a.y) || 0) - imgHeight,
-          width,
-          height: imgHeight
+          color:rgb(...(a.color || [0,0,0]))
         });
       }
     }
 
     const outBytes = await doc.save();
-    const outPath = path.join(TMP, uuid() + '.pdf');
+    const outPath = path.join(TMP, uuid()+'.pdf');
     fs.writeFileSync(outPath, outBytes);
 
-    sendFileAndCleanup(
-      res,
-      outPath,
-      'editado.pdf',
-      req.file ? [req.file.path] : []
-    );
+    sendFileAndCleanup(res, outPath, 'editado.pdf');
+
   } catch(e) {
-    console.error(e);
-    res.status(500).json({ error: e.message });
+    console.error('EDIT/ANNOTATE:', e);
+    if(!res.headersSent){
+      res.status(500).json({error:e.message});
+    }
   }
 });
+
 
 app.listen(PORT, () => console.log(`PDFTools rodando em http://localhost:${PORT}`));
